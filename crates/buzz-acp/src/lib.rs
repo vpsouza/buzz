@@ -110,6 +110,47 @@ async fn publish_presence(
     Ok(())
 }
 
+fn clear_completed_typing_channel(
+    typing_channels: &mut HashMap<Uuid, ThreadTags>,
+    origin_channel_id: Option<Uuid>,
+) -> bool {
+    origin_channel_id
+        .and_then(|channel_id| typing_channels.remove(&channel_id))
+        .is_some()
+}
+
+#[cfg(test)]
+mod completed_typing_channel_tests {
+    use super::*;
+
+    #[test]
+    fn agent_scoped_completion_clears_real_origin_not_nil_session_key() {
+        let origin_channel_id = Uuid::new_v4();
+        let unrelated_channel_id = Uuid::new_v4();
+        let mut typing_channels = HashMap::from([
+            (origin_channel_id, ThreadTags::default()),
+            (unrelated_channel_id, ThreadTags::default()),
+        ]);
+
+        assert!(clear_completed_typing_channel(
+            &mut typing_channels,
+            Some(origin_channel_id),
+        ));
+        assert!(!typing_channels.contains_key(&origin_channel_id));
+        assert!(typing_channels.contains_key(&unrelated_channel_id));
+        assert!(!typing_channels.contains_key(&Uuid::nil()));
+    }
+
+    #[test]
+    fn heartbeat_completion_does_not_clear_any_channel() {
+        let channel_id = Uuid::new_v4();
+        let mut typing_channels = HashMap::from([(channel_id, ThreadTags::default())]);
+
+        assert!(!clear_completed_typing_channel(&mut typing_channels, None));
+        assert!(typing_channels.contains_key(&channel_id));
+    }
+}
+
 fn emit_runtime_lifecycle(
     observer: Option<&observer::ObserverHandle>,
     start_nonce: &str,
@@ -3519,10 +3560,12 @@ async fn tokio_main() -> Result<()> {
 
         match pool_event {
             Some(PoolEvent::Result(result)) => {
-                // Stop typing indicator for the completed channel.
-                if let PromptSource::Channel(ch) = &result.source {
-                    typing_channels.remove(ch);
-                }
+                // Stop typing for the relay channel that originated the turn.
+                // In agent-scoped mode `source` carries the nil UUID because it
+                // is also the shared ACP session key; using it here left the
+                // real channel in `typing_channels` forever and made an idle
+                // FirstMate appear continuously active in Desktop.
+                clear_completed_typing_channel(&mut typing_channels, result.origin_channel_id);
                 if handle_prompt_result(
                     &mut pool,
                     &mut queue,
@@ -7530,6 +7573,7 @@ mod error_outcome_emission_tests {
         let result = PromptResult {
             agent,
             source: PromptSource::Channel(channel_id),
+            origin_channel_id: None,
             turn_id: "test-turn-id".into(),
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
             batch: None,
@@ -7602,6 +7646,7 @@ mod error_outcome_emission_tests {
         let result = PromptResult {
             agent,
             source: PromptSource::Channel(channel_id),
+            origin_channel_id: None,
             turn_id: "test-turn-id".into(),
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
             batch: None,
@@ -7716,6 +7761,7 @@ mod error_outcome_emission_tests {
         let result = PromptResult {
             agent,
             source: PromptSource::Channel(channel_id),
+            origin_channel_id: None,
             turn_id: "test-turn-id".into(),
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
             batch: None,
@@ -7779,6 +7825,7 @@ mod error_outcome_emission_tests {
         let result = PromptResult {
             agent,
             source: PromptSource::Channel(Uuid::new_v4()),
+            origin_channel_id: None,
             turn_id: "test-turn-id".to_string(),
             outcome,
             batch: None,
@@ -7947,6 +7994,7 @@ mod error_outcome_emission_tests {
             let result = PromptResult {
                 agent,
                 source: PromptSource::Channel(Uuid::new_v4()),
+                origin_channel_id: None,
                 turn_id: "test-turn-id".to_string(),
                 outcome,
                 batch: None,
@@ -8038,6 +8086,7 @@ mod error_outcome_emission_tests {
             let result = PromptResult {
                 agent,
                 source: PromptSource::Channel(channel_id),
+                origin_channel_id: None,
                 turn_id: "test-turn-id".to_string(),
                 outcome,
                 batch: Some(batch),
@@ -8144,6 +8193,7 @@ mod error_outcome_emission_tests {
             let result = PromptResult {
                 agent,
                 source: PromptSource::Channel(channel_id),
+                origin_channel_id: None,
                 turn_id: "test-turn-id".to_string(),
                 outcome,
                 batch: Some(batch),
@@ -8234,6 +8284,7 @@ mod error_outcome_emission_tests {
         let result = PromptResult {
             agent,
             source: PromptSource::Channel(channel_id),
+            origin_channel_id: None,
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Timeout(TimeoutKind::Hard {
                 recently_active: true,
@@ -8328,6 +8379,7 @@ mod error_outcome_emission_tests {
         let result = PromptResult {
             agent,
             source: PromptSource::Channel(channel_id),
+            origin_channel_id: None,
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Timeout(TimeoutKind::Hard {
                 recently_active: true,
@@ -8445,6 +8497,7 @@ mod error_outcome_emission_tests {
         let result = PromptResult {
             agent,
             source: PromptSource::Channel(channel_id),
+            origin_channel_id: None,
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::CancelDrainTimeout(grace),
             batch: Some(batch),
@@ -8575,6 +8628,7 @@ mod error_outcome_emission_tests {
         let result = PromptResult {
             agent,
             source: PromptSource::Channel(Uuid::new_v4()),
+            origin_channel_id: None,
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::CancelDrainTimeout(grace),
             // Explicit Stop already dropped the batch upstream in
@@ -8701,6 +8755,7 @@ mod error_outcome_emission_tests {
         let result = PromptResult {
             agent,
             source: PromptSource::Channel(channel_id),
+            origin_channel_id: None,
             turn_id: "indeterminate-project".into(),
             outcome: PromptOutcome::ProjectContextIndeterminate(
                 "project context is indeterminate".into(),
@@ -8850,6 +8905,7 @@ mod error_outcome_emission_tests {
         let result = PromptResult {
             agent,
             source: PromptSource::Channel(channel_id),
+            origin_channel_id: None,
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(auth_error),
             batch: Some(batch),
@@ -8936,6 +8992,7 @@ mod error_outcome_emission_tests {
         let result = PromptResult {
             agent,
             source: PromptSource::Channel(channel_id),
+            origin_channel_id: None,
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(usage_error),
             batch: Some(batch),

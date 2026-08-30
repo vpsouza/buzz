@@ -305,6 +305,11 @@ pub struct AgentPool {
 pub struct PromptResult {
     pub agent: OwnedAgent,
     pub source: PromptSource,
+    /// Relay channel that originated the turn. This differs from `source` for
+    /// agent-scoped sessions, where `source` uses the nil UUID as the shared
+    /// session key but UI-facing ephemeral state must still be cleared from
+    /// the real channel.
+    pub origin_channel_id: Option<Uuid>,
     /// Identifies the completed turn for observer terminal events.
     pub turn_id: String,
     pub outcome: PromptOutcome,
@@ -1869,6 +1874,7 @@ fn send_prompt_result(
     turn_id: &str,
     mut agent: OwnedAgent,
     source: PromptSource,
+    origin_channel_id: Option<Uuid>,
     outcome: PromptOutcome,
     batch: Option<FlushBatch>,
 ) {
@@ -1876,6 +1882,7 @@ fn send_prompt_result(
     let _ = result_tx.send(PromptResult {
         agent,
         source,
+        origin_channel_id,
         turn_id: turn_id.to_owned(),
         outcome,
         batch,
@@ -2000,6 +2007,7 @@ pub async fn run_prompt_task(
                     &turn_id,
                     agent,
                     source,
+                    observer_channel_id,
                     PromptOutcome::ProjectContextIndeterminate(error.0),
                     requeue_batch_if_queue(&ctx, batch),
                 );
@@ -2183,6 +2191,7 @@ pub async fn run_prompt_task(
                             &turn_id,
                             agent,
                             source,
+                            observer_channel_id,
                             PromptOutcome::AgentExited,
                             requeue_batch_if_queue(&ctx, batch),
                         );
@@ -2196,6 +2205,7 @@ pub async fn run_prompt_task(
                             &turn_id,
                             agent,
                             source,
+                            observer_channel_id,
                             PromptOutcome::Error(e),
                             requeue_batch_if_queue(&ctx, batch),
                         );
@@ -2240,6 +2250,7 @@ pub async fn run_prompt_task(
                             &turn_id,
                             agent,
                             source,
+                            observer_channel_id,
                             PromptOutcome::AgentExited,
                             None,
                         );
@@ -2251,6 +2262,7 @@ pub async fn run_prompt_task(
                             &turn_id,
                             agent,
                             source,
+                            observer_channel_id,
                             PromptOutcome::Error(e),
                             None,
                         );
@@ -2360,6 +2372,7 @@ pub async fn run_prompt_task(
                         &turn_id,
                         agent,
                         source,
+                        observer_channel_id,
                         PromptOutcome::AgentExited,
                         requeue_batch_if_queue(&ctx, batch),
                     );
@@ -2396,6 +2409,7 @@ pub async fn run_prompt_task(
                                 &turn_id,
                                 agent,
                                 source,
+                                observer_channel_id,
                                 PromptOutcome::AgentExited,
                                 requeue_batch_if_queue(&ctx, batch),
                             );
@@ -2414,6 +2428,7 @@ pub async fn run_prompt_task(
                         &turn_id,
                         agent,
                         source,
+                        observer_channel_id,
                         PromptOutcome::Timeout(TimeoutKind::Idle),
                         requeue_batch_if_queue(&ctx, batch),
                     );
@@ -2432,6 +2447,7 @@ pub async fn run_prompt_task(
                         &turn_id,
                         agent,
                         source,
+                        observer_channel_id,
                         PromptOutcome::Timeout(TimeoutKind::Hard { recently_active }),
                         requeue_batch_if_queue(&ctx, batch),
                     );
@@ -2448,6 +2464,7 @@ pub async fn run_prompt_task(
                         &turn_id,
                         agent,
                         source,
+                        observer_channel_id,
                         PromptOutcome::Error(e),
                         requeue_batch_if_queue(&ctx, batch),
                     );
@@ -2570,6 +2587,7 @@ pub async fn run_prompt_task(
             &turn_id,
             agent,
             source,
+            observer_channel_id,
             PromptOutcome::Error(AcpError::Protocol("no batch and no prompt_text".into())),
             None,
         );
@@ -2712,6 +2730,7 @@ pub async fn run_prompt_task(
                                     &turn_id,
                                     agent,
                                     source,
+                                    observer_channel_id,
                                     PromptOutcome::Cancelled,
                                     retry_batch,
                                 );
@@ -2748,6 +2767,7 @@ pub async fn run_prompt_task(
                                     &turn_id,
                                     agent,
                                     source,
+                                    observer_channel_id,
                                     failure.outcome,
                                     failure.retry_batch,
                                 );
@@ -2822,6 +2842,7 @@ pub async fn run_prompt_task(
                             &turn_id,
                             agent,
                             source,
+                            observer_channel_id,
                             PromptOutcome::Ok(StopReason::EndTurn),
                             None, // turn succeeded — batch was processed, no requeue
                         );
@@ -2907,6 +2928,7 @@ pub async fn run_prompt_task(
                 &turn_id,
                 agent,
                 source,
+                observer_channel_id,
                 PromptOutcome::Ok(stop_reason),
                 None,
             );
@@ -2929,6 +2951,7 @@ pub async fn run_prompt_task(
                 &turn_id,
                 agent,
                 source,
+                observer_channel_id,
                 PromptOutcome::AgentExited,
                 requeue_batch_if_queue(&ctx, batch),
             );
@@ -2963,6 +2986,7 @@ pub async fn run_prompt_task(
                         &turn_id,
                         agent,
                         source,
+                        observer_channel_id,
                         PromptOutcome::Timeout(TimeoutKind::Idle),
                         requeue_batch_if_queue(&ctx, batch),
                     );
@@ -2989,6 +3013,7 @@ pub async fn run_prompt_task(
                         &turn_id,
                         agent,
                         source,
+                        observer_channel_id,
                         PromptOutcome::AgentExited,
                         requeue_batch_if_queue(&ctx, batch),
                     );
@@ -3014,6 +3039,7 @@ pub async fn run_prompt_task(
                         &turn_id,
                         agent,
                         source,
+                        observer_channel_id,
                         PromptOutcome::Timeout(TimeoutKind::Idle),
                         requeue_batch_if_queue(&ctx, batch),
                     );
@@ -3043,6 +3069,7 @@ pub async fn run_prompt_task(
                 &turn_id,
                 agent,
                 source,
+                observer_channel_id,
                 PromptOutcome::Timeout(TimeoutKind::Hard { recently_active }),
                 requeue_batch_if_queue(&ctx, batch),
             );
@@ -3070,6 +3097,7 @@ pub async fn run_prompt_task(
                 &turn_id,
                 agent,
                 source,
+                observer_channel_id,
                 PromptOutcome::Error(e),
                 requeue_batch_if_queue(&ctx, batch),
             );
@@ -7855,18 +7883,28 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         // Simulate session-create error: early-return path calls
         // `send_prompt_result` without the read loop ever running `take()`.
         let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel::<PromptResult>();
-        let source = PromptSource::Heartbeat;
+        // Agent-scoped turns use the nil UUID as their shared ACP session key,
+        // while ephemeral relay state belongs to the real origin channel.
+        let origin_channel_id = Uuid::new_v4();
+        let source = PromptSource::Channel(Uuid::nil());
         send_prompt_result(
             &result_tx,
             "test-turn-id",
             agent,
             source,
+            Some(origin_channel_id),
             PromptOutcome::Error(AcpError::Protocol("simulated session-create error".into())),
             None,
         );
 
         // Receive the PromptResult back from the channel.
         let mut result = result_rx.recv().await.expect("PromptResult must be sent");
+
+        assert_eq!(
+            result.origin_channel_id,
+            Some(origin_channel_id),
+            "agent-scoped completion must retain the real relay channel so typing can be cleared"
+        );
 
         // steer_rx must be cleared even though the read loop never ran take().
         assert!(
@@ -7922,6 +7960,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             "test-turn-id",
             agent,
             source,
+            None,
             PromptOutcome::Ok(StopReason::EndTurn),
             None,
         );
