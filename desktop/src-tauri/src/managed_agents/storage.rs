@@ -268,6 +268,10 @@ pub fn load_managed_agents<R: tauri::Runtime>(
 ) -> Result<Vec<ManagedAgentRecord>, String> {
     let mut records = load_agent_store(app)?;
     records.retain(|record| !record.pubkey.is_empty());
+    // Do not infer FirstMate authority from the routing scope. Older MVP
+    // records must be explicitly re-saved as FirstMate through the validated
+    // command/UI boundary; otherwise a hand-edited `session_scope=agent`
+    // could silently cross the full-access authority boundary on load.
     hydrate_keys(&mut records);
     Ok(records)
 }

@@ -128,6 +128,9 @@ export type RawManagedAgent = {
   idle_timeout_seconds: number | null;
   max_turn_duration_seconds: number | null;
   parallelism: number;
+  working_directory?: string | null;
+  session_scope?: "channel" | "agent";
+  firstmate?: boolean;
   system_prompt: string | null;
   avatar_url?: string | null;
   model: string | null;
@@ -643,6 +646,9 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     idleTimeoutSeconds: agent.idle_timeout_seconds,
     maxTurnDurationSeconds: agent.max_turn_duration_seconds,
     parallelism: agent.parallelism,
+    workingDirectory: agent.working_directory ?? null,
+    sessionScope: agent.session_scope ?? "channel",
+    firstmate: agent.firstmate ?? false,
     systemPrompt: agent.system_prompt,
     avatarUrl: agent.avatar_url ?? null,
     model: agent.model,
@@ -798,6 +804,9 @@ export async function createManagedAgent(input: CreateManagedAgentInput) {
         idleTimeoutSeconds: input.idleTimeoutSeconds,
         maxTurnDurationSeconds: input.maxTurnDurationSeconds,
         parallelism: input.parallelism,
+        workingDirectory: input.workingDirectory,
+        sessionScope: input.sessionScope,
+        firstmate: input.firstmate ?? false,
         systemPrompt: input.systemPrompt,
         avatarUrl: input.avatarUrl,
         model: input.model,
@@ -818,6 +827,21 @@ export async function createManagedAgent(input: CreateManagedAgentInput) {
     profileSyncError: response.profile_sync_error,
     spawnError: response.spawn_error,
   };
+}
+
+/** Validate and canonicalize a prospective FirstMate home before saving. */
+export async function validateFirstMateHome(path: string): Promise<string> {
+  return invokeTauri<string>("validate_firstmate_home_path", { path });
+}
+
+/** Native directory picker for a prospective FirstMate home. `null` means cancel. */
+export function pickFirstMateHome(): Promise<string | null> {
+  return invokeTauri<string | null>("pick_firstmate_home");
+}
+
+/** Clone the official FirstMate repository into an absent or empty directory. */
+export function cloneFirstMateHome(path: string): Promise<string> {
+  return invokeTauri<string>("clone_firstmate_home", { path });
 }
 
 export async function deleteManagedAgent(

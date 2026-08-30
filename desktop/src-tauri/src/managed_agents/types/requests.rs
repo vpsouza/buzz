@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use super::{
     default_start_on_app_launch, validate_respond_to_allowlist, AgentDefinition, BackendKind,
-    CatalogSource, RelayMeshConfig, RespondTo,
+    CatalogSource, RelayMeshConfig, RespondTo, SessionScope,
 };
 
 /// The NIP-AP behavioral group as one grouped request field.
@@ -163,6 +163,14 @@ pub struct CreateManagedAgentRequest {
     pub idle_timeout_seconds: Option<u64>,
     pub max_turn_duration_seconds: Option<u64>,
     pub parallelism: Option<u32>,
+    #[serde(default)]
+    pub working_directory: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub session_scope: SessionScope,
+    /// Explicit FirstMate integration mode. Its working-directory/runtime
+    /// contract is validated and normalized at the command boundary.
+    #[serde(default)]
+    pub firstmate: bool,
     pub system_prompt: Option<String>,
     pub avatar_url: Option<String>,
     pub model: Option<String>,
@@ -213,6 +221,15 @@ pub struct UpdateManagedAgentRequest {
     pub env_vars: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub parallelism: Option<u32>,
+    /// Absent = don't touch; null = return to the default Buzz working directory.
+    #[serde(default, deserialize_with = "crate::util::double_option")]
+    pub working_directory: Option<Option<std::path::PathBuf>>,
+    /// Absent = don't touch. Agent scope is reserved for a validated FirstMate home.
+    #[serde(default)]
+    pub session_scope: Option<SessionScope>,
+    /// Absent = preserve FirstMate identity; present = enter/leave it.
+    #[serde(default)]
+    pub firstmate: Option<bool>,
     /// Accepted for wire compatibility; not applied to the stored record.
     /// `BUZZ_ACP_TURN_TIMEOUT` is deprecated and ignored by the harness.
     ///
@@ -258,6 +275,25 @@ pub struct UpdateManagedAgentRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn firstmate_identity_is_explicit_in_create_and_update_requests() {
+        let create: CreateManagedAgentRequest = serde_json::from_value(serde_json::json!({
+            "name": "Claude FirstMate",
+            "firstmate": true,
+            "agentCommand": "claude"
+        }))
+        .expect("deserialize create request");
+        assert!(create.firstmate);
+        assert_eq!(create.agent_command.as_deref(), Some("claude"));
+
+        let update: UpdateManagedAgentRequest = serde_json::from_value(serde_json::json!({
+            "pubkey": "agent",
+            "firstmate": false
+        }))
+        .expect("deserialize update request");
+        assert_eq!(update.firstmate, Some(false));
+    }
 
     fn record_with_quad() -> AgentDefinition {
         let mut record = record_without_quad();

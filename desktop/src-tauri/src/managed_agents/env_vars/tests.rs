@@ -136,6 +136,37 @@ fn is_reserved_recognises_full_list() {
 }
 
 #[test]
+fn firstmate_lock_bridge_keys_are_reserved() {
+    let agent = map(&[
+        ("BUZZ_FIRSTMATE_HOME", "/forged/home"),
+        ("BUZZ_FIRSTMATE_HARNESS_PID", "999999"),
+        ("FM_HOME", "/forged/home"),
+    ]);
+    assert!(
+        merged_user_env(&BTreeMap::new(), &agent).is_empty(),
+        "the Desktop and ACP sidecar, not a persona, own FirstMate lock identity"
+    );
+}
+
+#[test]
+fn firstmate_herdr_binary_contract_key_is_reserved() {
+    let agent = map(&[("BUZZ_FIRSTMATE_HERDR_BINARY", "/forged/herdr")]);
+    assert!(
+        merged_user_env(&BTreeMap::new(), &agent).is_empty(),
+        "only the Desktop broker may choose the Herdr binary for a managed FirstMate"
+    );
+}
+
+#[test]
+fn firstmate_codex_execution_mode_is_reserved() {
+    let agent = map(&[("INITIAL_AGENT_MODE", "agent")]);
+    assert!(
+        merged_user_env(&BTreeMap::new(), &agent).is_empty(),
+        "only the validated FirstMate launch path may select Codex full access"
+    );
+}
+
+#[test]
 fn reserved_keys_include_agent_owner_for_legacy_records() {
     // Legacy records without auth_tag fall back to BUZZ_ACP_AGENT_OWNER
     // to enforce the respond-to gate. Must not be user-overridable.

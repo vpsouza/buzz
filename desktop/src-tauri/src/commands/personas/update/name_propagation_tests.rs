@@ -61,6 +61,9 @@ fn agent(persona_id: &str, name: &str, display_name: Option<&str>) -> ManagedAge
         definition_parallelism: None,
         relay_mesh: None,
         effort_level: None,
+        working_directory: None,
+        session_scope: crate::managed_agents::SessionScope::Channel,
+        firstmate: false,
     }
 }
 

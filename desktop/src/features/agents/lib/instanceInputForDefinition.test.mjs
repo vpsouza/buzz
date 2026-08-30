@@ -157,6 +157,23 @@ test("mapping carries the runtime and definition fields", async () => {
   assert.deepEqual(input.backend, { type: "local" });
 });
 
+test("FirstMate intent creates the complete validated local runtime contract", async () => {
+  const input = await buildInstanceInputForDefinition(
+    persona({ runtime: "claude" }),
+    claudeRuntime,
+    undefined,
+    { type: "firstmate", home: "/tmp/atlas-fm-home" },
+  );
+  assert.equal(input.firstmate, true);
+  assert.equal(input.workingDirectory, "/tmp/atlas-fm-home");
+  assert.equal(input.sessionScope, "agent");
+  assert.equal(input.parallelism, 1);
+  assert.deepEqual(input.backend, { type: "local" });
+  assert.deepEqual(input.envVars, { BUZZ_FIRSTMATE_MULTIPLEXER: "herdr" });
+  assert.equal(input.agentCommand, "claude-cmd");
+  assert.equal(input.spawnAfterCreate, true);
+});
+
 test("no backend intent is byte-identical to the pre-intent mapping", async () => {
   // The 3 pre-B5 call sites (useManagedAgentActions, usePersonaActions,
   // UserProfilePanel) pass no intent; their output must not move.

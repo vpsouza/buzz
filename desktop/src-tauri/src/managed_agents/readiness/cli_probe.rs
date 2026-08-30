@@ -1,4 +1,8 @@
 use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
+
+const LOGIN_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 use crate::managed_agents::runtime::build_augmented_path;
 
@@ -58,17 +62,46 @@ pub(crate) fn login_probe(
     probe_args: &[&str],
     augmented_path: Option<&str>,
 ) -> ProbeOutcome {
+    login_probe_with_timeout(binary_path, probe_args, augmented_path, LOGIN_PROBE_TIMEOUT)
+}
+
+fn login_probe_with_timeout(
+    binary_path: &Path,
+    probe_args: &[&str],
+    augmented_path: Option<&str>,
+    timeout: Duration,
+) -> ProbeOutcome {
     let mut command = std::process::Command::new(binary_path);
     command.args(&probe_args[1..]);
     if let Some(path) = augmented_path {
         command.env("PATH", path);
     }
     crate::util::configure_no_window(&mut command);
+    command.stdout(Stdio::null()).stderr(Stdio::piped());
 
-    match command.output() {
-        Ok(o) if o.status.success() => ProbeOutcome::LoggedIn,
-        Ok(o) => classify_probe_output(&o.stderr, false),
-        Err(_) => ProbeOutcome::LoggedOut,
+    let Ok(mut child) = command.spawn() else {
+        return ProbeOutcome::LoggedOut;
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return ProbeOutcome::LoggedIn,
+            Ok(Some(_)) => {
+                let mut stderr = Vec::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = std::io::Read::read_to_end(&mut pipe, &mut stderr);
+                }
+                return classify_probe_output(&stderr, false);
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return ProbeOutcome::LoggedOut;
+            }
+        }
     }
 }
 
@@ -99,6 +132,33 @@ pub(crate) fn classify_probe_output(stderr_bytes: &[u8], exit_success: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::{ProbeOutcome, CONFIG_PARSE_SIGNALS};
+
+    #[cfg(unix)]
+    #[test]
+    fn login_probe_kills_a_hung_cli_at_the_deadline() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let script_path = temp.path().join("hung-codex");
+        fs::write(&script_path, "#!/bin/sh\nexec /bin/sleep 60\n").expect("write script");
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod script");
+
+        let started = Instant::now();
+        let outcome = super::login_probe_with_timeout(
+            &script_path,
+            &["hung-codex", "login", "status"],
+            None,
+            Duration::from_millis(100),
+        );
+
+        assert_eq!(outcome, ProbeOutcome::LoggedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a hung readiness CLI must not stall restore"
+        );
+    }
 
     #[cfg(unix)]
     #[test]

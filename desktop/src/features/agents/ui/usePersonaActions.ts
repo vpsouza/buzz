@@ -17,6 +17,7 @@ import {
   type AgentSnapshotImportPreview,
   type AgentSnapshotImportResult,
 } from "@/features/agents/hooks";
+import { refreshAcpRuntimesForAddAgent } from "@/features/agents/acpRuntimesQuery";
 import {
   getLibraryPersonas,
   getPersonaLabelsById,
@@ -424,6 +425,10 @@ export function usePersonaActions() {
   function prepareCreate() {
     clearFeedback("library");
     setShouldLoadAcpRuntimes(true);
+    // Add Agent is a deliberate configuration action. Probe once here so a
+    // newly-installed Claude/Codex CLI is not rendered from the cold cheap
+    // catalog; normal browsing continues to use that cheap cache path.
+    void refreshAcpRuntimesForAddAgent(queryClient);
   }
 
   function openEdit(persona: AgentPersona) {

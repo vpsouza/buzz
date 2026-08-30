@@ -440,7 +440,15 @@ fn collect_missing_requirements(
             "complete Claude Code authentication by running the Claude CLI",
             rt,
         ),
-        "codex" => cli_login::requirements(&["codex", "login", "status"], "run `codex login`", rt),
+        "codex" => cli_login::requirements_with_binary(
+            &["codex", "login", "status"],
+            "run `codex login`",
+            rt,
+            effective
+                .env
+                .get("BUZZ_FIRSTMATE_CODEX_BINARY")
+                .map(std::path::Path::new),
+        ),
         _ => vec![],
     }
 }
@@ -1179,6 +1187,25 @@ mod tests {
     }
 
     #[test]
+    fn cli_login_requirements_prefers_trusted_probe_binary() {
+        let exe = present_binary_str();
+        let rt = make_cli_runtime(
+            static_commands(vec![exe]),
+            Some("__buzz_broken_ambient_cli_abc123__"),
+        );
+        let reqs = cli_login::requirements_with_binary(
+            &["__buzz_broken_ambient_cli_abc123__", "--list"],
+            "this should not show",
+            &rt,
+            Some(std::path::Path::new(exe)),
+        );
+        assert!(
+            reqs.is_empty(),
+            "trusted bundled binary must replace the ambient CLI probe: {reqs:?}"
+        );
+    }
+
+    #[test]
     fn cli_login_requirements_logged_out_emits_available() {
         // Both adapter and CLI present, but probe exits non-zero (logged out).
         // Use the test binary with an unrecognized argument as the probe —
@@ -1532,6 +1559,9 @@ mod tests {
             definition_parallelism: None,
             relay_mesh: None,
             effort_level: None,
+            working_directory: None,
+            session_scope: crate::managed_agents::SessionScope::Channel,
+            firstmate: false,
         };
 
         let runtime = known_acp_runtime_exact("buzz-agent");

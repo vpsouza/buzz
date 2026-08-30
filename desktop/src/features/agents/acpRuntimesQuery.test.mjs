@@ -187,6 +187,7 @@ import {
   applyBootWarmGate,
   getBootWarmSnapshot,
   refreshAcpRuntimes,
+  refreshAcpRuntimesForAddAgent,
   startBootWarm,
   useAcpRuntimesQueryForced,
 } from "./acpRuntimesQuery.ts";
@@ -369,6 +370,27 @@ describe("boot-warm gate drives cheap consumers through the initial pass", () =>
 
     queryClient.unmount();
   });
+});
+
+it("Add Agent refresh forces discovery instead of reusing the cold catalog", async () => {
+  const queryClient = makeQueryClient();
+  discoverHandler = () => Promise.resolve([rawEntry("claude", "logged_in")]);
+
+  await refreshAcpRuntimesForAddAgent(queryClient);
+
+  assert.equal(
+    calls.filter(
+      (call) =>
+        call.command === "discover_acp_providers" && call.args?.force === true,
+    ).length,
+    1,
+    "opening Add Agent must request one forced probe",
+  );
+  assert.equal(
+    queryClient.getQueryData(acpRuntimesQueryKey)?.[0]?.id,
+    "claude",
+    "the forced result must replace the shared cheap catalog",
+  );
 });
 
 describe("refreshAcpRuntimes cannot dedup onto an in-flight cheap request", () => {

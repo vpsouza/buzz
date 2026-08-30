@@ -1,5 +1,129 @@
 use crate::managed_agents::known_acp_runtime;
 
+#[cfg(target_os = "macos")]
+#[test]
+fn resolves_codex_cli_bundled_with_codex_acp() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let package_root = temp
+        .path()
+        .join("lib/node_modules/@agentclientprotocol/codex-acp");
+    let adapter_entry = package_root.join("dist/index.js");
+    std::fs::create_dir_all(adapter_entry.parent().expect("adapter parent"))
+        .expect("create adapter dist");
+    std::fs::write(&adapter_entry, "#!/usr/bin/env node\n").expect("write adapter");
+    let (package, triple) = match std::env::consts::ARCH {
+        "aarch64" => ("codex-darwin-arm64", "aarch64-apple-darwin"),
+        "x86_64" => ("codex-darwin-x64", "x86_64-apple-darwin"),
+        other => panic!("unexpected macOS arch {other}"),
+    };
+    let codex = package_root
+        .join("node_modules/@openai")
+        .join(package)
+        .join("vendor")
+        .join(triple)
+        .join("bin")
+        .join("codex");
+    std::fs::create_dir_all(codex.parent().expect("codex parent")).expect("create vendor");
+    std::fs::write(&codex, "codex").expect("write codex");
+    let command = temp.path().join("bin/codex-acp");
+    std::fs::create_dir_all(command.parent().expect("command parent")).expect("create bin");
+    symlink(&adapter_entry, &command).expect("link adapter");
+
+    assert_eq!(
+        super::bundled_codex_cli(command.to_str().expect("utf8 command")),
+        Some(std::fs::canonicalize(codex).expect("canonical codex"))
+    );
+}
+
+#[test]
+fn only_persisted_validated_firstmate_mode_forces_codex_full_access() {
+    let root = std::env::temp_dir().join(format!(
+        "buzz-runtime-firstmate-mode-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(root.join("bin")).expect("create bin");
+    std::fs::create_dir_all(root.join("state")).expect("create state");
+    std::fs::write(root.join("AGENTS.md"), "# FirstMate").expect("create AGENTS.md");
+    let home = std::fs::canonicalize(&root).expect("canonical FirstMate home");
+
+    let mut record = super::test_fixtures::fixture(
+        crate::managed_agents::RespondTo::Anyone,
+        vec![],
+        Some("tag".into()),
+    );
+    record.session_scope = crate::managed_agents::SessionScope::Agent;
+    record.firstmate = true;
+    record.agent_command = "codex".to_string();
+    record.working_directory = Some(home.clone());
+    let mode = super::validated_firstmate_initial_agent_mode(&record, Some(&home))
+        .expect("validated FirstMate record");
+    assert_eq!(mode, Some("agent-full-access"));
+
+    // FirstMate attestation applies to Claude too, but Codex's execution-mode
+    // override is intentionally never injected for another harness.
+    record.agent_command = "claude".to_string();
+    assert_eq!(
+        super::validated_firstmate_initial_agent_mode(&record, Some(&home))
+            .expect("validated Claude FirstMate record"),
+        None
+    );
+    record.agent_command = "codex".to_string();
+
+    // Imported/updated channel agents may point at a FirstMate-shaped local
+    // directory, but the persisted FirstMate session mode is absent.
+    record.session_scope = crate::managed_agents::SessionScope::Channel;
+    record.firstmate = false;
+    assert_eq!(
+        super::validated_firstmate_initial_agent_mode(&record, Some(&home))
+            .expect("channel record is not FirstMate"),
+        None
+    );
+
+    std::fs::remove_dir_all(root).expect("remove FirstMate test directory");
+}
+
+#[test]
+fn inherited_initial_agent_mode_is_removed_for_all_spawns() {
+    let mut command = std::process::Command::new("buzz-acp");
+    command.env("INITIAL_AGENT_MODE", "agent");
+    super::remove_inherited_initial_agent_mode(&mut command);
+
+    let mode = command
+        .get_envs()
+        .find(|(key, _)| *key == "INITIAL_AGENT_MODE")
+        .map(|(_, value)| value.map(|value| value.to_os_string()));
+    assert_eq!(mode, Some(None));
+}
+
+#[test]
+fn pseudo_firstmate_home_never_gets_full_access_mode() {
+    let root = std::env::temp_dir().join(format!(
+        "buzz-runtime-pseudo-firstmate-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(root.join("bin")).expect("create bin");
+    std::fs::create_dir_all(root.join("state")).expect("create state");
+    let home = std::fs::canonicalize(&root).expect("canonical pseudo home");
+    let mut record = super::test_fixtures::fixture(
+        crate::managed_agents::RespondTo::Anyone,
+        vec![],
+        Some("tag".into()),
+    );
+    record.session_scope = crate::managed_agents::SessionScope::Agent;
+    record.firstmate = true;
+    record.working_directory = Some(home.clone());
+
+    assert!(
+        super::validated_firstmate_initial_agent_mode(&record, Some(&home)).is_err(),
+        "a directory without AGENTS.md is not a FirstMate home"
+    );
+    std::fs::remove_dir_all(root).expect("remove pseudo-home test directory");
+}
+
 #[path = "cli_tests.rs"]
 mod cli_tests;
 

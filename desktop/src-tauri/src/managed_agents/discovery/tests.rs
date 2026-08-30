@@ -1,15 +1,45 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::overrides::{divergent_agent_command_override, update_time_agent_command_override};
 use super::{
     apply_agent_command_update, classify_runtime, codex_adapter_availability,
-    codex_adapter_is_outdated, create_time_agent_command_override, default_agent_command,
-    effective_agent_command, find_nvm_default_bin, is_login_shell_path_uninit, is_safe_nvm_tag,
-    managed_agent_avatar_url, normalize_agent_args, parse_semver_tag, probe_codex_acp_version,
-    record_agent_command, refresh_login_shell_path, try_record_agent_command,
-    BUZZ_AGENT_AVATAR_URL, CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL, GOOSE_AVATAR_URL,
+    codex_adapter_is_outdated, command_search_dirs_for, create_time_agent_command_override,
+    default_agent_command, effective_agent_command, find_nvm_default_bin,
+    is_login_shell_path_uninit, is_safe_nvm_tag, managed_agent_avatar_url, normalize_agent_args,
+    parse_semver_tag, probe_codex_acp_version, record_agent_command, refresh_login_shell_path,
+    try_record_agent_command, BUZZ_AGENT_AVATAR_URL, CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL,
+    GOOSE_AVATAR_URL,
 };
 use crate::managed_agents::AcpAvailabilityStatus;
+
+#[test]
+fn installed_bundle_prefers_its_sidecars_over_workspace_target_output() {
+    let workspace = Path::new("/workspace/buzz-src");
+    let bundle_sidecars = Path::new("/Applications/Buzz.app/Contents/MacOS");
+    let dirs = command_search_dirs_for(workspace, None, Some(bundle_sidecars), true);
+
+    assert_eq!(dirs.first(), Some(&bundle_sidecars.to_path_buf()));
+    assert!(
+        dirs.iter()
+            .position(|dir| dir == bundle_sidecars)
+            .expect("bundle directory")
+            < dirs
+                .iter()
+                .position(|dir| dir == &workspace.join("target/release"))
+                .expect("workspace release directory"),
+        "an installed Buzz must not launch source-tree sidecars first"
+    );
+}
+
+#[test]
+fn dev_and_test_searches_keep_workspace_target_before_executable_parent() {
+    let workspace = Path::new("/workspace/buzz-src");
+    let executable_parent = Path::new("/tmp/buzz-dev-sidecars");
+    let dirs = command_search_dirs_for(workspace, None, Some(executable_parent), false);
+
+    assert_eq!(dirs.first(), Some(&workspace.join("target/debug")));
+    assert_eq!(dirs.last(), Some(&executable_parent.to_path_buf()));
+}
 
 #[test]
 fn resolves_known_avatar_for_bare_command() {
@@ -268,6 +298,9 @@ fn record_with(
         definition_parallelism: None,
         relay_mesh: None,
         effort_level: None,
+        working_directory: None,
+        session_scope: crate::managed_agents::SessionScope::Channel,
+        firstmate: false,
     }
 }
 
@@ -1180,6 +1213,17 @@ fn test_claude_and_codex_have_cli_install_commands() {
         !codex.cli_install_commands.is_empty(),
         "codex must have cli install commands"
     );
+}
+
+/// Every conversational coding runtime must receive the Buzz messaging bridge.
+/// ACP assistant output is activity telemetry; without this MCP server Claude
+/// can finish a turn successfully while publishing nothing into the channel.
+#[test]
+fn test_claude_and_codex_have_buzz_messaging_bridge() {
+    let claude = super::known_acp_runtime_exact("claude").unwrap();
+    let codex = super::known_acp_runtime_exact("codex").unwrap();
+    assert_eq!(claude.mcp_command, Some("buzz-dev-mcp"));
+    assert_eq!(codex.mcp_command, Some("buzz-dev-mcp"));
 }
 
 /// cli_install_commands_for_os returns a non-empty slice for claude and codex.

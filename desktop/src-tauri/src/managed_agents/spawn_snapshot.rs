@@ -44,6 +44,24 @@ use super::{
 pub(crate) mod diff;
 pub(crate) use diff::{eligible_restart_diff, RestartDiffEntry, TrackedSpawnState};
 
+const FIRSTMATE_BUZZ_CONTEXT: &str = "You are the Buzz-facing primary for this FirstMate home. Run and trust the normal FirstMate session-start contract before mutable work. Use buzz-cli for Buzz communication and preserve the originating channel and thread when replying. Buzz instructions do not override FirstMate locks or authority rules.";
+
+/// Add only the Buzz transport contract for an agent-scoped FirstMate session.
+/// The FirstMate `AGENTS.md` loaded from its working directory remains the
+/// operational authority.
+pub(crate) fn effective_system_prompt_for_scope(
+    record: &ManagedAgentRecord,
+    prompt: Option<&str>,
+) -> Option<String> {
+    if !record.firstmate {
+        return prompt.map(str::to_string);
+    }
+    match prompt.map(str::trim).filter(|prompt| !prompt.is_empty()) {
+        Some(prompt) => Some(format!("{FIRSTMATE_BUZZ_CONTEXT}\n\n{prompt}")),
+        None => Some(FIRSTMATE_BUZZ_CONTEXT.to_string()),
+    }
+}
+
 /// Resolve the current instructions for this instance's deployment-time team binding.
 /// A deleted team deliberately degrades to no team section.
 pub(crate) fn effective_team_instructions(
@@ -127,6 +145,10 @@ pub(crate) struct SpawnConfigSnapshot {
     pub idle_timeout_seconds: Option<u64>,
     pub max_turn_duration_seconds: Option<u64>,
     pub parallelism: u32,
+    /// Canonical local process directory, when this agent owns one.
+    pub working_directory: Option<std::path::PathBuf>,
+    /// The ACP session ownership boundary (`channel` or `agent`).
+    pub session_scope: String,
     /// The startup effort the harness will actually apply, resolved by
     /// [`effective_effort`]: the persisted canonical `record.effort_level` when
     /// present, else the user-seeded `BUZZ_ACP_EFFORT_LEVEL` from the layered
@@ -190,7 +212,7 @@ impl SpawnConfigSnapshot {
             },
             relay_url: relay_url.to_string(),
             team_instructions: team_instructions.map(str::to_string),
-            system_prompt: system_prompt.map(str::to_string),
+            system_prompt: effective_system_prompt_for_scope(record, system_prompt),
             model: model.map(str::to_string),
             provider: provider.map(str::to_string),
             session_title: (!descriptor.env.contains_key(SESSION_TITLE_ENV_VAR))
@@ -214,6 +236,11 @@ impl SpawnConfigSnapshot {
             // pool and must badge. The diff surface consequently displays the
             // effective value — that is correct, it is what actually runs.
             parallelism: super::effective_parallelism(&descriptor.command, record.parallelism),
+            working_directory: record.working_directory.clone(),
+            session_scope: match record.session_scope {
+                super::types::SessionScope::Channel => "channel".to_string(),
+                super::types::SessionScope::Agent => "agent".to_string(),
+            },
             // Sole effort representation — see the field doc and the `env`
             // strip above. Resolver reads the record's canonical value and the
             // raw descriptor env (before the strip), so a user-seeded env value
@@ -298,6 +325,7 @@ pub(crate) fn prospective_spawn_config_snapshot(
         EffectiveConfigResult::OrphanedInstance { .. } => (None, None, None),
     };
 
+    let system_prompt = effective_system_prompt_for_scope(record, prompt.as_deref());
     SpawnConfigSnapshot::from_inputs(SpawnConfigInputs {
         record,
         descriptor: &descriptor,
@@ -305,7 +333,7 @@ pub(crate) fn prospective_spawn_config_snapshot(
         // (legacy pins ignored), so a workspace relay change must badge.
         relay_url: &crate::relay::effective_agent_relay_url(&record.relay_url, workspace_relay),
         team_instructions: effective_team_instructions(record, teams).as_deref(),
-        system_prompt: prompt.as_deref(),
+        system_prompt: system_prompt.as_deref(),
         model: model.as_deref(),
         provider: provider.as_deref(),
         enforced_owner_only,

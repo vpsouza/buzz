@@ -618,6 +618,9 @@ pub async fn confirm_team_snapshot_import(
             definition_parallelism: minted_parallelism,
             relay_mesh: None,
             effort_level: None,
+            working_directory: None,
+            session_scope: crate::managed_agents::SessionScope::Channel,
+            firstmate: false,
             runtime: member.definition.runtime.clone(),
             name_pool: member.definition.name_pool.clone(),
         };

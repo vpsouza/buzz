@@ -459,10 +459,34 @@ pub async fn restore_managed_agents_on_launch(
             })
             .collect();
 
+    // The frontend may finish its initial agents query while Phase B is still
+    // probing runtimes. Persisting the children is not enough: without the
+    // pair-status event that interactive starts emit, that initial `Stopped`
+    // snapshot remains visible until an unrelated refetch. Build the statuses
+    // only after every child is registered so the UI observes an atomic launch.
+    let restored_statuses = successfully_spawned
+        .iter()
+        .filter_map(|(pubkey, relay_url)| {
+            let record = records.iter().find(|record| record.pubkey == *pubkey)?;
+            let key = super::ManagedAgentRuntimeKey::new(pubkey.clone(), relay_url).ok()?;
+            Some(super::runtime_commands::status_for(
+                app,
+                record,
+                &key,
+                runtimes.get(&key),
+                None,
+            ))
+        })
+        .collect::<Vec<_>>();
+
     save_managed_agents(app, &records)?;
     drop(runtimes);
     drop(_store_guard);
     drop(restore_transition);
+
+    for status in &restored_statuses {
+        super::runtime_commands::emit_status(app, status);
+    }
 
     // ── Profile reconciliation (fire-and-forget) ────────────────────────────
     // Spawn background tasks to ensure each restored agent's kind:0 profile is

@@ -225,6 +225,18 @@ export async function refreshAcpRuntimes(
 }
 
 /**
+ * Add Agent is an explicit configuration surface, so it refreshes runtime
+ * availability once when opened. Keeping this named boundary separate from
+ * the cheap query makes it impossible for an automatic cache refetch on a
+ * hot surface to accidentally pay for CLI discovery.
+ */
+export function refreshAcpRuntimesForAddAgent(
+  queryClient: ReturnType<typeof useQueryClient>,
+) {
+  return refreshAcpRuntimes(queryClient);
+}
+
+/**
  * ACP runtimes query for surfaces that need fresh auth/version state: Settings
  * harness panels and onboarding.
  *

@@ -125,7 +125,11 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         commands: &["claude-agent-acp", "claude-code-acp"],
         aliases: &["claude-code", "claudecode"],
         avatar_url: CLAUDE_CODE_AVATAR_URL,
-        mcp_command: None,
+        // Claude's ACP transcript is observer telemetry, not a channel reply.
+        // Give Claude the same Buzz messaging bridge as Codex so it can obey
+        // the base prompt's mandatory `buzz messages send` contract instead
+        // of leaving its answer visible only in the Activity panel.
+        mcp_command: Some("buzz-dev-mcp"),
         mcp_hooks: false,
         underlying_cli: Some("claude"),
         cli_install_commands: &["curl -fsSL https://claude.ai/install.sh | bash"],
@@ -489,23 +493,53 @@ fn profile_target_dirs(root: &Path) -> [PathBuf; 2] {
     }
 }
 
-fn command_search_dirs() -> Vec<PathBuf> {
-    let mut dirs = profile_target_dirs(&workspace_root_dir()).to_vec();
-    if let Ok(current_dir) = std::env::current_dir() {
-        dirs.extend(profile_target_dirs(&current_dir));
-    }
+fn installed_bundle_should_prefer_sidecars(executable: &Path, workspace_root: &Path) -> bool {
+    // A developer/test binary has a matching target dir and must keep the
+    // workspace sidecars first. A packaged release instead lives beside the
+    // bundled sidecars (for example Buzz.app/Contents/MacOS), which must win
+    // over any stale source-tree target/release left on the machine.
+    !cfg!(debug_assertions) && !executable.starts_with(workspace_root.join("target"))
+}
 
-    dirs.extend(
-        std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(Path::to_path_buf)),
-    );
+fn command_search_dirs_for(
+    workspace_root: &Path,
+    current_dir: Option<&Path>,
+    executable_parent: Option<&Path>,
+    prefer_executable_parent: bool,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if prefer_executable_parent {
+        dirs.extend(executable_parent.map(Path::to_path_buf));
+    }
+    dirs.extend(profile_target_dirs(workspace_root));
+    if let Some(current_dir) = current_dir {
+        dirs.extend(profile_target_dirs(current_dir));
+    }
+    if !prefer_executable_parent {
+        dirs.extend(executable_parent.map(Path::to_path_buf));
+    }
     dirs.into_iter().fold(Vec::new(), |mut unique, dir| {
         if !unique.contains(&dir) {
             unique.push(dir);
         }
         unique
     })
+}
+
+fn command_search_dirs() -> Vec<PathBuf> {
+    let workspace_root = workspace_root_dir();
+    let executable = std::env::current_exe().ok();
+    let executable_parent = executable.as_deref().and_then(|path| path.parent());
+    let prefer_executable_parent = executable
+        .as_deref()
+        .is_some_and(|path| installed_bundle_should_prefer_sidecars(path, &workspace_root));
+    let current_dir = std::env::current_dir().ok();
+    command_search_dirs_for(
+        &workspace_root,
+        current_dir.as_deref(),
+        executable_parent,
+        prefer_executable_parent,
+    )
 }
 
 fn is_executable_file(path: &Path) -> bool {

@@ -92,6 +92,44 @@ fn stop_managed_agent_pair<R: tauri::Runtime>(
     Ok(())
 }
 
+/// Run the FirstMate-owned pre-stop policy once per record-level termination.
+/// Pair-scoped and record-wide callers share this guard so config changes and
+/// deletion cannot accidentally bypass an ordinary-stop refusal.
+fn prepare_record_stop(
+    record: &ManagedAgentRecord,
+    runtimes: &HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
+) -> Result<(), String> {
+    let mut harness_pids = managed_agent_runtime_keys(runtimes, &record.pubkey)
+        .into_iter()
+        .filter_map(|key| runtimes.get(&key).map(|runtime| runtime.child.id()))
+        .collect::<Vec<_>>();
+    if let Some(pid) = record.runtime_pid {
+        if !harness_pids.contains(&pid) {
+            harness_pids.push(pid);
+        }
+    }
+    super::super::firstmate_lifecycle::prepare_firstmate_stop(record, &harness_pids)
+}
+
+/// Release the Herdr lease only after this record no longer owns a live ACP
+/// child. Tmux remains explicit and does not touch Herdr state.
+fn release_firstmate_herdr_if_selected<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    record: &ManagedAgentRecord,
+) -> Result<(), String> {
+    if record.session_scope != crate::managed_agents::SessionScope::Agent
+        || !super::super::herdr_fleet_manager::FirstMateMultiplexer::from_agent_env(
+            &record.env_vars,
+        )?
+        .is_herdr()
+    {
+        return Ok(());
+    }
+    let home = super::super::validate_record_working_directory(record)?
+        .ok_or("FirstMate managed agent is missing its working directory")?;
+    super::super::herdr_fleet_manager::release_firstmate_herdr_endpoint(app, &record.pubkey, &home)
+}
+
 /// Terminate a legacy scalar-PID child (pre-pair records) and remove the
 /// agent-scoped pid file. Pair receipts are restored separately.
 fn stop_legacy_scalar_pid<R: tauri::Runtime>(
@@ -125,11 +163,15 @@ pub fn stop_managed_agent_workspace_pair(
     record: &mut ManagedAgentRecord,
     runtimes: &mut HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
 ) -> Result<(), String> {
+    prepare_record_stop(record, runtimes)?;
     use tauri::Manager;
     let state = app.state::<crate::app_state::AppState>();
     match super::workspace_pair_key(app, record) {
         Some(pair_key) if runtimes.contains_key(&pair_key) => {
             stop_managed_agent_pair(app, record, runtimes, &pair_key)?;
+            if managed_agent_runtime_keys(runtimes, &record.pubkey).is_empty() {
+                release_firstmate_herdr_if_selected(app, record)?;
+            }
             state.clear_agent_session_cache(&pair_key);
             super::super::remove_agent_pid_file(app, &record.pubkey);
             let now = now_iso();
@@ -143,10 +185,12 @@ pub fn stop_managed_agent_workspace_pair(
             // No tracked pair here — a pubkey-wide cache clear would disturb
             // live pairs in other communities, so stay pair-scoped.
             stop_legacy_scalar_pid(app, record)?;
+            release_firstmate_herdr_if_selected(app, record)?;
             state.clear_agent_session_cache(&pair_key);
         }
         None => {
             stop_legacy_scalar_pid(app, record)?;
+            release_firstmate_herdr_if_selected(app, record)?;
             state.clear_agent_session_caches(&record.pubkey);
         }
     }
@@ -158,9 +202,11 @@ pub fn stop_managed_agent_process<R: tauri::Runtime>(
     record: &mut ManagedAgentRecord,
     runtimes: &mut HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
 ) -> Result<(), String> {
+    prepare_record_stop(record, runtimes)?;
     let keys = managed_agent_runtime_keys(runtimes, &record.pubkey);
     if keys.is_empty() {
-        return stop_legacy_scalar_pid(app, record);
+        stop_legacy_scalar_pid(app, record)?;
+        return release_firstmate_herdr_if_selected(app, record);
     }
 
     let mut errors = Vec::new();
@@ -168,6 +214,10 @@ pub fn stop_managed_agent_process<R: tauri::Runtime>(
         if let Err(error) = stop_managed_agent_pair(app, record, runtimes, &key) {
             errors.push(format!("{}: {error}", key.relay_url));
         }
+    }
+
+    if errors.is_empty() {
+        release_firstmate_herdr_if_selected(app, record)?;
     }
 
     let now = now_iso();

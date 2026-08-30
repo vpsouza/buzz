@@ -16,8 +16,11 @@ mod definition_validation;
 mod discovery;
 pub(crate) mod effective_config;
 mod env_vars;
+pub(crate) mod firstmate_bridge;
+pub(crate) mod firstmate_lifecycle;
 pub(crate) mod git_bash;
 pub(crate) mod global_config;
+pub(crate) mod herdr_fleet_manager;
 mod managed_node_paths;
 mod nest;
 pub(crate) mod parallelism;
@@ -41,6 +44,7 @@ pub(crate) mod storage;
 pub(crate) mod team_catalog;
 pub(crate) mod team_events;
 mod team_repair;
+pub(crate) mod working_directory;
 pub(crate) use team_repair::team_persona_key;
 mod teams;
 mod types;
@@ -89,6 +93,7 @@ pub use runtime_types::*;
 pub use storage::*;
 pub use teams::*;
 pub use types::*;
+pub(crate) use working_directory::{validate_record_working_directory, validate_working_directory};
 
 #[cfg(test)]
 pub(crate) use teams::delete_catalog_team_at;

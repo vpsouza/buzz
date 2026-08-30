@@ -92,5 +92,8 @@ pub(super) fn fixture(
         definition_parallelism: None,
         relay_mesh: None,
         effort_level: None,
+        working_directory: None,
+        session_scope: crate::managed_agents::SessionScope::Channel,
+        firstmate: false,
     }
 }

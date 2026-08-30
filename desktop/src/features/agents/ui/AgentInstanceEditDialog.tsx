@@ -25,6 +25,11 @@ import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
 import { Dialog } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
 import { setManagedAgentAutoRestart } from "@/shared/api/tauriManagedAgents";
+import {
+  cloneFirstMateHome,
+  pickFirstMateHome,
+  validateFirstMateHome,
+} from "@/shared/api/tauri";
 import { EffortPickerField } from "./EffortPickerField";
 import { EditAgentAdvancedFields } from "./EditAgentAdvancedFields";
 import {
@@ -135,6 +140,15 @@ export function AgentInstanceEditDialog({
   const [parallelism, setParallelism] = React.useState(
     String(agent.parallelism),
   );
+  const [workingDirectory, setWorkingDirectory] = React.useState(
+    agent.workingDirectory ?? "",
+  );
+  const [firstmate, setFirstmate] = React.useState(agent.firstmate);
+  const [firstmateHomeStatus, setFirstmateHomeStatus] = React.useState<
+    "idle" | "checking" | "valid" | "invalid"
+  >(agent.firstmate && agent.workingDirectory ? "idle" : "idle");
+  const [firstmateHomeMessage, setFirstmateHomeMessage] = React.useState("");
+  const [isCloningFirstmate, setIsCloningFirstmate] = React.useState(false);
   const [systemPrompt, setSystemPrompt] = React.useState(
     agent.systemPrompt ?? "",
   );
@@ -188,6 +202,10 @@ export function AgentInstanceEditDialog({
       );
       setAgentArgs(agent.agentArgs.join(","));
       setParallelism(String(agent.parallelism));
+      setWorkingDirectory(agent.workingDirectory ?? "");
+      setFirstmate(agent.firstmate);
+      setFirstmateHomeStatus("idle");
+      setFirstmateHomeMessage("");
       setSystemPrompt(agent.systemPrompt ?? "");
       setModel(agent.model ?? "");
       setIsCustomModelEditing(false);
@@ -209,6 +227,43 @@ export function AgentInstanceEditDialog({
       updateMutation.reset();
     }
   }, [open, agent.pubkey]);
+
+  React.useEffect(() => {
+    if (!open || !firstmate) return;
+    const path = workingDirectory.trim();
+    if (!path) {
+      setFirstmateHomeStatus("invalid");
+      setFirstmateHomeMessage(
+        "Choose the FirstMate home that contains AGENTS.md, bin/, and state/.",
+      );
+      return;
+    }
+    let active = true;
+    setFirstmateHomeStatus("checking");
+    const timer = window.setTimeout(() => {
+      void validateFirstMateHome(path).then(
+        (canonical) => {
+          if (!active) return;
+          setWorkingDirectory(canonical);
+          setFirstmateHomeStatus("valid");
+          setFirstmateHomeMessage("Canonical FirstMate home verified.");
+        },
+        (error) => {
+          if (!active) return;
+          setFirstmateHomeStatus("invalid");
+          setFirstmateHomeMessage(
+            error instanceof Error
+              ? error.message
+              : "This folder is not a valid FirstMate home.",
+          );
+        },
+      );
+    }, 250);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [open, firstmate, workingDirectory]);
 
   // Re-derive the runtime id when the catalog loads.
   React.useEffect(() => {
@@ -613,6 +668,7 @@ export function AgentInstanceEditDialog({
       requiredEnvKeyMissing,
     }) &&
     providerValid &&
+    (!firstmate || firstmateHomeStatus === "valid") &&
     !updateMutation.isPending &&
     !isAvatarUploadPending;
 
@@ -680,6 +736,17 @@ export function AgentInstanceEditDialog({
           parsedParallelism > 0 && parsedParallelism !== agent.parallelism
             ? parsedParallelism
             : undefined,
+        workingDirectory:
+          (workingDirectory.trim() || null) !== agent.workingDirectory
+            ? workingDirectory.trim() || null
+            : undefined,
+        sessionScope:
+          (firstmate ? "agent" : "channel") !== agent.sessionScope
+            ? firstmate
+              ? "agent"
+              : "channel"
+            : undefined,
+        firstmate: firstmate !== agent.firstmate ? firstmate : undefined,
         // Linked instances defer model/provider/systemPrompt to the definition.
         systemPrompt:
           linkedPersona != null
@@ -1174,6 +1241,172 @@ export function AgentInstanceEditDialog({
                     key="edit-agent-advanced-fields"
                     transition={advancedFieldsTransition}
                   >
+                    <div className="mb-4 space-y-3 rounded-md border border-border p-3">
+                      <div className="space-y-2 rounded-md border border-border/70 bg-muted/20 p-3">
+                        <label className="flex cursor-pointer items-start gap-2 text-sm">
+                          <input
+                            checked={firstmate}
+                            disabled={updateMutation.isPending}
+                            onChange={(event) => {
+                              setFirstmate(event.target.checked);
+                            }}
+                            type="checkbox"
+                          />
+                          <span className="space-y-0.5">
+                            <span className="block font-medium">
+                              FirstMate orchestration home
+                            </span>
+                            <span className="block text-xs text-muted-foreground">
+                              One continuous primary session coordinates
+                              crewmates through the shared Herdr server.
+                            </span>
+                          </span>
+                        </label>
+                        {firstmate ? (
+                          <div className="space-y-1 pl-6">
+                            <label
+                              className="text-xs font-medium"
+                              htmlFor="agent-working-directory"
+                            >
+                              FirstMate home path
+                            </label>
+                            <div className="flex gap-2">
+                              <Input
+                                aria-describedby="firstmate-home-status"
+                                aria-invalid={firstmateHomeStatus === "invalid"}
+                                disabled={
+                                  updateMutation.isPending || isCloningFirstmate
+                                }
+                                id="agent-working-directory"
+                                onChange={(event) =>
+                                  setWorkingDirectory(event.target.value)
+                                }
+                                placeholder="/absolute/path/to/fm-home"
+                                value={workingDirectory}
+                              />
+                              <Button
+                                disabled={
+                                  updateMutation.isPending || isCloningFirstmate
+                                }
+                                onClick={() => {
+                                  void pickFirstMateHome().then(
+                                    (path) => {
+                                      if (path) setWorkingDirectory(path);
+                                    },
+                                    (error) => {
+                                      setFirstmateHomeStatus("invalid");
+                                      setFirstmateHomeMessage(
+                                        error instanceof Error
+                                          ? error.message
+                                          : "Couldn't open the FirstMate folder picker.",
+                                      );
+                                    },
+                                  );
+                                }}
+                                type="button"
+                                variant="outline"
+                              >
+                                Choose folder
+                              </Button>
+                            </div>
+                            <p
+                              className={cn(
+                                "text-xs",
+                                firstmateHomeStatus === "invalid"
+                                  ? "text-destructive"
+                                  : "text-muted-foreground",
+                              )}
+                              id="firstmate-home-status"
+                            >
+                              {firstmateHomeStatus === "checking"
+                                ? "Checking AGENTS.md, bin/, state/, and canonical path…"
+                                : firstmateHomeMessage ||
+                                  "Paste the path to its fm-home. Buzz stores the canonical path and validates it before launch."}
+                            </p>
+                            {firstmateHomeStatus === "invalid" &&
+                            workingDirectory.trim() ? (
+                              <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-background p-2.5">
+                                <p className="text-xs text-muted-foreground">
+                                  Not a FirstMate home yet. Clone the official
+                                  FirstMate repository into this empty folder?
+                                </p>
+                                <Button
+                                  className="shrink-0"
+                                  disabled={
+                                    updateMutation.isPending ||
+                                    isCloningFirstmate
+                                  }
+                                  onClick={() => {
+                                    setIsCloningFirstmate(true);
+                                    setFirstmateHomeStatus("checking");
+                                    setFirstmateHomeMessage(
+                                      "Cloning FirstMate…",
+                                    );
+                                    void cloneFirstMateHome(
+                                      workingDirectory.trim(),
+                                    ).then(
+                                      (canonical) => {
+                                        setIsCloningFirstmate(false);
+                                        setWorkingDirectory(canonical);
+                                        setFirstmateHomeStatus("valid");
+                                        setFirstmateHomeMessage(
+                                          `Cloned and validated ${canonical}`,
+                                        );
+                                      },
+                                      (error: unknown) => {
+                                        setIsCloningFirstmate(false);
+                                        setFirstmateHomeStatus("invalid");
+                                        setFirstmateHomeMessage(
+                                          error instanceof Error
+                                            ? error.message
+                                            : String(error),
+                                        );
+                                      },
+                                    );
+                                  }}
+                                  size="sm"
+                                  type="button"
+                                  variant="outline"
+                                >
+                                  {isCloningFirstmate
+                                    ? "Cloning…"
+                                    : "Clone FirstMate"}
+                                </Button>
+                              </div>
+                            ) : null}
+                            <p className="text-xs text-muted-foreground">
+                              Local backend, one worker, and agent-scoped
+                              session are enforced. Codex receives its validated
+                              full-access mode; Claude keeps its native autonomy
+                              mode.
+                            </p>
+                          </div>
+                        ) : null}
+                      </div>
+                      {!firstmate ? (
+                        <div className="space-y-1">
+                          <label
+                            className="text-sm font-medium"
+                            htmlFor="agent-working-directory"
+                          >
+                            Working directory
+                          </label>
+                          <Input
+                            disabled={updateMutation.isPending}
+                            id="agent-working-directory"
+                            onChange={(event) =>
+                              setWorkingDirectory(event.target.value)
+                            }
+                            placeholder="/absolute/path/to/firstmate"
+                            value={workingDirectory}
+                          />
+                          <p className="text-xs text-muted-foreground">
+                            Local only. Buzz validates and stores its canonical
+                            path.
+                          </p>
+                        </div>
+                      ) : null}
+                    </div>
                     <EditAgentAdvancedFields
                       acpCommand={acpCommand}
                       agentArgs={agentArgs}

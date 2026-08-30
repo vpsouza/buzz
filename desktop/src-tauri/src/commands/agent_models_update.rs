@@ -100,6 +100,44 @@ pub async fn update_managed_agent(
         if let Some(parallelism) = input.parallelism {
             record.parallelism = parallelism;
         }
+        let prospective_firstmate = input.firstmate.unwrap_or(record.firstmate);
+        let prospective_working_directory = match input.working_directory.clone() {
+            Some(path) => crate::managed_agents::validate_working_directory(path)?,
+            None => record.working_directory.clone(),
+        };
+        let prospective_session_scope = if prospective_firstmate {
+            crate::managed_agents::SessionScope::Agent
+        } else if input.firstmate == Some(false) {
+            crate::managed_agents::SessionScope::Channel
+        } else {
+            input.session_scope.unwrap_or(record.session_scope)
+        };
+        if !prospective_firstmate
+            && prospective_session_scope == crate::managed_agents::SessionScope::Agent
+        {
+            return Err("agent session scope is reserved for explicit FirstMate mode".to_string());
+        }
+        let mut prospective_directory_record = record.clone();
+        prospective_directory_record.working_directory = prospective_working_directory.clone();
+        prospective_directory_record.session_scope = prospective_session_scope;
+        prospective_directory_record.firstmate = prospective_firstmate;
+        crate::managed_agents::validate_record_working_directory(&prospective_directory_record)?;
+        if prospective_firstmate && record.backend != crate::managed_agents::BackendKind::Local {
+            return Err("FirstMate agents must use the local backend".to_string());
+        }
+        if input.working_directory.is_some() {
+            record.working_directory = prospective_working_directory;
+        }
+        if input.session_scope.is_some() {
+            record.session_scope = prospective_session_scope;
+        }
+        if input.firstmate.is_some() {
+            record.firstmate = prospective_firstmate;
+            record.session_scope = prospective_session_scope;
+        }
+        if record.firstmate {
+            record.parallelism = 1;
+        }
         // turn_timeout_seconds is intentionally not applied here —
         // BUZZ_ACP_TURN_TIMEOUT is deprecated and ignored by the harness.
         // Use idle_timeout_seconds or max_turn_duration_seconds instead.
@@ -140,6 +178,16 @@ pub async fn update_managed_agent(
             crate::managed_agents::validate_user_env_keys(&env_vars)?;
             record.env_vars = env_vars;
         }
+        // Crossing the FirstMate authority boundary, moving its canonical
+        // home, or changing its runtime env (including the multiplexer) cannot
+        // be deferred to a later config-drift poll. The currently running ACP
+        // owns lifecycle state for the *old* home and must be stopped using
+        // that old snapshot before the replacement record is persisted.
+        let firstmate_runtime_boundary_changed = record.firstmate != previous_record.firstmate
+            || record.working_directory != previous_record.working_directory
+            || record.session_scope != previous_record.session_scope
+            || ((record.firstmate || previous_record.firstmate)
+                && record.env_vars != previous_record.env_vars);
 
         // Native provider/model fields are authoritative. Keep the typed marker
         // derived for new records while retaining legacy typed records for
@@ -187,7 +235,9 @@ pub async fn update_managed_agent(
         // refresh from observing a saved narrow policy while the old broad
         // process is still alive. A stop failure aborts before mutation.
         let mut access_restart_relays = Vec::new();
-        if access_policy_changed && record.backend == crate::managed_agents::BackendKind::Local {
+        if (access_policy_changed || firstmate_runtime_boundary_changed)
+            && record.backend == crate::managed_agents::BackendKind::Local
+        {
             access_restart_relays =
                 crate::managed_agents::managed_agent_runtime_keys(&runtimes, &record.pubkey)
                     .into_iter()
@@ -200,7 +250,17 @@ pub async fn update_managed_agent(
                 ));
             }
             if !access_restart_relays.is_empty() {
-                crate::managed_agents::stop_managed_agent_process(&app, record, &mut runtimes)?;
+                let mut old_runtime_record = previous_record.clone();
+                crate::managed_agents::stop_managed_agent_process(
+                    &app,
+                    &mut old_runtime_record,
+                    &mut runtimes,
+                )?;
+                record.runtime_pid = old_runtime_record.runtime_pid;
+                record.last_stopped_at = old_runtime_record.last_stopped_at;
+                record.last_exit_code = old_runtime_record.last_exit_code;
+                record.last_error = old_runtime_record.last_error;
+                record.last_error_code = old_runtime_record.last_error_code;
             }
         }
 

@@ -7,12 +7,18 @@ export type WhereToRunDraft = {
   runOn: "local" | string;
   providerConfig: Record<string, string>;
   probedProvider: BackendProviderProbeResult | null;
+  firstmate: boolean;
+  firstmateHome: string;
+  firstmateHomeValid: boolean;
 };
 
 export const emptyWhereToRunDraft: WhereToRunDraft = {
   runOn: "local",
   providerConfig: {},
   probedProvider: null,
+  firstmate: false,
+  firstmateHome: "",
+  firstmateHomeValid: false,
 };
 
 /**
@@ -57,13 +63,20 @@ export function providerConfigComplete(draft: WhereToRunDraft): boolean {
 }
 
 export function canSubmitWhereToRun(draft: WhereToRunDraft): boolean {
+  if (draft.runOn === "local" && draft.firstmate) {
+    return draft.firstmateHomeValid;
+  }
   return providerConfigComplete(draft);
 }
 
 export function resolveBackendIntent(
   draft: WhereToRunDraft,
 ): BackendIntent | null {
-  if (draft.runOn === "local") return null;
+  if (draft.runOn === "local") {
+    return draft.firstmate
+      ? { type: "firstmate", home: draft.firstmateHome }
+      : null;
+  }
   return {
     type: "provider",
     id: draft.runOn,

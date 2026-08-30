@@ -22,7 +22,8 @@
     "test:e2e:integration": "pnpm build:e2e && playwright test --project=integration",
     "test:e2e:release-smoke": "pnpm build:e2e && playwright test --config=playwright.release-smoke.config.ts",
     "test:e2e:report": "playwright show-report",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "tauri:build:firstmate:macos": "bash scripts/build-firstmate-macos.sh"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

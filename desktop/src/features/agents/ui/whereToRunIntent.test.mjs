@@ -52,6 +52,21 @@ test("local draft resolves to null intent", () => {
   assert.equal(resolveBackendIntent(emptyWhereToRunDraft), null);
 });
 
+test("FirstMate local draft gates on a validated fm-home and resolves explicitly", () => {
+  const incomplete = {
+    ...emptyWhereToRunDraft,
+    firstmate: true,
+    firstmateHome: "/tmp/fm-home",
+  };
+  assert.equal(canSubmitWhereToRun(incomplete), false);
+  const valid = { ...incomplete, firstmateHomeValid: true };
+  assert.equal(canSubmitWhereToRun(valid), true);
+  assert.deepEqual(resolveBackendIntent(valid), {
+    type: "firstmate",
+    home: "/tmp/fm-home",
+  });
+});
+
 test("provider draft resolves with coerced config values", () => {
   const intent = resolveBackendIntent(providerDraft());
   assert.deepEqual(intent, {

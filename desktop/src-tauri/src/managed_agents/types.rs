@@ -162,6 +162,9 @@ impl AgentDefinition {
             definition_parallelism: self.parallelism,
             relay_mesh: None,
             effort_level: None,
+            working_directory: None,
+            session_scope: SessionScope::Channel,
+            firstmate: false,
         }
     }
 }
@@ -283,6 +286,18 @@ pub struct ManagedAgentRecord {
     pub max_turn_duration_seconds: Option<u64>,
     #[serde(default = "default_agent_parallelism")]
     pub parallelism: u32,
+    /// Local-only directory in which the ACP harness runs. It is canonicalized
+    /// and validated before persistence and again at the spawn boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<PathBuf>,
+    /// Whether ACP sessions are isolated by channel (the legacy behavior) or
+    /// shared by this managed-agent identity (used by FirstMate homes).
+    #[serde(default)]
+    pub session_scope: SessionScope,
+    /// Explicit FirstMate identity. `session_scope` controls ACP routing only;
+    /// this bit is the authority boundary for FirstMate lifecycle and full access.
+    #[serde(default)]
+    pub firstmate: bool,
     pub system_prompt: Option<String>,
     /// Desired LLM model ID. Matches AgentModelInfo.id from discovery.
     /// The harness re-discovers the correct ACP switching metadata at session
@@ -518,6 +533,10 @@ pub struct ManagedAgentSummary {
     pub idle_timeout_seconds: Option<u64>,
     pub max_turn_duration_seconds: Option<u64>,
     pub parallelism: u32,
+    pub working_directory: Option<PathBuf>,
+    pub session_scope: SessionScope,
+    /// Explicit FirstMate identity; never derived from `session_scope` by runtime code.
+    pub firstmate: bool,
     pub system_prompt: Option<String>,
     pub avatar_url: Option<String>,
     pub model: Option<String>,
@@ -762,6 +781,18 @@ pub const DEFAULT_ACP_COMMAND: &str = "buzz-acp";
 /// ~5 min (320s) — matches the CLI harness default (BUZZ_ACP_IDLE_TIMEOUT).
 pub const DEFAULT_AGENT_TURN_TIMEOUT_SECONDS: u64 = 320;
 pub const DEFAULT_AGENT_PARALLELISM: u32 = 10;
+
+/// Session ownership boundary for a managed ACP agent.
+///
+/// `Channel` preserves the long-standing Buzz default. `Agent` is intentionally
+/// opt-in because it gives every addressed channel one shared primary session.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionScope {
+    #[default]
+    Channel,
+    Agent,
+}
 
 fn default_agent_parallelism() -> u32 {
     DEFAULT_AGENT_PARALLELISM

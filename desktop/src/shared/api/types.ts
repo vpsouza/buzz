@@ -329,6 +329,12 @@ export type ManagedAgent = {
   idleTimeoutSeconds: number | null;
   maxTurnDurationSeconds: number | null;
   parallelism: number;
+  /** Canonical local directory used as the ACP process CWD. */
+  workingDirectory: string | null;
+  /** `agent` shares one ACP primary session across all Buzz origins. */
+  sessionScope: "channel" | "agent";
+  /** Explicit, persisted FirstMate integration identity. Never inferred from sessionScope. */
+  firstmate: boolean;
   systemPrompt: string | null;
   avatarUrl: string | null;
   model: string | null;
@@ -414,6 +420,10 @@ export type CreateManagedAgentInput = {
   idleTimeoutSeconds?: number;
   maxTurnDurationSeconds?: number;
   parallelism?: number;
+  workingDirectory?: string;
+  sessionScope?: "channel" | "agent";
+  /** Enables the validated FirstMate integration. Its runtime contract is fixed server-side. */
+  firstmate?: boolean;
   systemPrompt?: string;
   avatarUrl?: string;
   model?: string;
@@ -682,6 +692,11 @@ export type UpdateManagedAgentInput = {
   /** Absent = don't touch. Present = replace the env_vars map entirely. */
   envVars?: Record<string, string>;
   parallelism?: number;
+  /** `null` returns to Buzz's default work directory. */
+  workingDirectory?: string | null;
+  sessionScope?: "channel" | "agent";
+  /** Absent = preserve. Present = explicitly enter or leave FirstMate mode. */
+  firstmate?: boolean;
   turnTimeoutSeconds?: number;
   relayUrl?: string;
   acpCommand?: string;

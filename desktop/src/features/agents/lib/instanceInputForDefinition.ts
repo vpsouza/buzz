@@ -82,11 +82,16 @@ export function resolveStartRuntimeForDefinition(
  *   is true because the preset commands deliberately override the
  *   definition's runtime preference.
  */
-export type BackendIntent = {
-  type: "provider";
-  id: string;
-  config: Record<string, unknown>;
-};
+export type BackendIntent =
+  | {
+      type: "provider";
+      id: string;
+      config: Record<string, unknown>;
+    }
+  | {
+      type: "firstmate";
+      home: string;
+    };
 
 /**
  * The single definition→instance mapping (Phase 1B.3.5 rows 2–4). Every
@@ -136,6 +141,27 @@ export async function buildInstanceInputForDefinition(
         id: backendIntent.id,
         config: backendIntent.config,
       },
+    };
+  }
+
+  if (backendIntent?.type === "firstmate") {
+    return {
+      ...base,
+      acpCommand: "buzz-acp",
+      agentCommand: runtime.command,
+      agentArgs: [],
+      mcpCommand: runtime.mcpCommand ?? "",
+      harnessOverride: !persona.runtime || persona.runtime === runtime.id,
+      model: persona.model ?? undefined,
+      provider: persona.provider ?? undefined,
+      spawnAfterCreate: true,
+      startOnAppLaunch: true,
+      backend: { type: "local" },
+      firstmate: true,
+      workingDirectory: backendIntent.home,
+      sessionScope: "agent",
+      parallelism: 1,
+      envVars: { BUZZ_FIRSTMATE_MULTIPLEXER: "herdr" },
     };
   }
 

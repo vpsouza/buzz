@@ -1,6 +1,83 @@
 use super::*;
 use crate::managed_agents::AgentDefinition;
 
+#[cfg(unix)]
+fn run_git(git: &std::path::Path, cwd: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new(git)
+        .args(args)
+        .current_dir(cwd)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?} failed");
+}
+
+#[cfg(unix)]
+fn firstmate_clone_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    use std::fs;
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir_all(source.join("bin")).unwrap();
+    fs::write(source.join("AGENTS.md"), "# FirstMate\n").unwrap();
+    fs::write(source.join("bin/fm-bootstrap.sh"), "#!/bin/sh\n").unwrap();
+    let git = std::path::PathBuf::from("/usr/bin/git");
+    run_git(&git, &source, &["init", "-q"]);
+    run_git(&git, &source, &["add", "AGENTS.md", "bin/fm-bootstrap.sh"]);
+    run_git(
+        &git,
+        &source,
+        &[
+            "-c",
+            "user.name=Buzz Test",
+            "-c",
+            "user.email=buzz@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    );
+    (temp, source)
+}
+
+#[cfg(unix)]
+#[test]
+fn clones_and_initializes_a_fresh_firstmate_home() {
+    let (temp, source) = firstmate_clone_fixture();
+    let destination = temp.path().join("new-firstmate");
+    let canonical = clone_firstmate_home_from(
+        &destination,
+        source.to_str().unwrap(),
+        std::path::Path::new("/usr/bin/git"),
+    )
+    .unwrap();
+    assert_eq!(
+        canonical,
+        destination.canonicalize().unwrap().to_string_lossy()
+    );
+    assert!(destination.join("state").is_dir());
+    crate::managed_agents::working_directory::validate_firstmate_home(&destination).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn clone_refuses_to_overwrite_an_occupied_directory() {
+    let (temp, source) = firstmate_clone_fixture();
+    let destination = temp.path().join("occupied");
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(destination.join("keep.txt"), "keep").unwrap();
+    let error = clone_firstmate_home_from(
+        &destination,
+        source.to_str().unwrap(),
+        std::path::Path::new("/usr/bin/git"),
+    )
+    .unwrap_err();
+    assert!(error.contains("not empty"));
+    assert_eq!(
+        std::fs::read_to_string(destination.join("keep.txt")).unwrap(),
+        "keep"
+    );
+}
+
 fn bare_agent_record(
     persona_id: Option<&str>,
     model: Option<&str>,
@@ -61,6 +138,9 @@ fn bare_agent_record(
         team_catalog_source: None,
         relay_mesh: None,
         effort_level: None,
+        working_directory: None,
+        session_scope: SessionScope::Channel,
+        firstmate: false,
         auto_restart_on_config_change: false,
         definition_respond_to: None,
         definition_respond_to_allowlist: vec![],

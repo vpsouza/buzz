@@ -93,6 +93,9 @@ fn make_agent(name: &str, persona_id: Option<&str>) -> ManagedAgentRecord {
         definition_parallelism: None,
         relay_mesh: None,
         effort_level: None,
+        working_directory: None,
+        session_scope: super::super::SessionScope::Channel,
+        firstmate: false,
     }
 }
 

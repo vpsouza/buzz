@@ -46,6 +46,43 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     // launch.policy_env. A user-supplied BUZZ_ACP_AGENTS would bypass the
     // harness cap and cause OpenClaw agents to spawn uncapped workers.
     "BUZZ_ACP_AGENTS",
+    // Codex permission mode is a trusted launch policy for validated
+    // FirstMate sessions. A persona must not downgrade it and lose access to
+    // the broker-owned Herdr Unix socket, or upgrade an unrelated agent.
+    "INITIAL_AGENT_MODE",
+    // FirstMate authority is derived only from the validated managed-agent
+    // record; accepting a user override would let arbitrary env configuration
+    // impersonate a mutable FirstMate home.
+    "BUZZ_FIRSTMATE_HOME",
+    "BUZZ_FIRSTMATE_HARNESS_PID",
+    // The ACP broker allocates this monotonic per-home supervision generation
+    // during launch; persisted/user configuration may never select it.
+    "BUZZ_FIRSTMATE_SUPERVISOR_GENERATION",
+    // Attests that Desktop validated an explicit persisted FirstMate record
+    // and canonical home for this exact launch. Never accept user input.
+    "BUZZ_FIRSTMATE_PERSISTED",
+    // Desktop resolves the Codex CLI shipped inside the installed Codex ACP
+    // runtime. FirstMate workers must not be redirected to an arbitrary
+    // executable by saved persona/agent env.
+    "BUZZ_FIRSTMATE_CODEX_BINARY",
+    // The ACP sidecar uses this broker-issued PID to terminate itself when
+    // the Desktop dies abruptly (so a crash/forced quit cannot orphan it).
+    "BUZZ_DESKTOP_PID",
+    // The FirstMate lock bridge proves that this matches the canonical Buzz
+    // home. A user-provided FM_HOME could otherwise redirect tool calls before
+    // the ACP sidecar derives the authoritative value for its Codex child.
+    "FM_HOME",
+    // Herdr endpoint authority is broker-issued and must not be supplied by
+    // persona/agent env. The adapter accepts it only after validating the
+    // exact session/socket/workspace/root-pane tuple.
+    "BUZZ_FIRSTMATE_HERDR_SESSION",
+    "BUZZ_FIRSTMATE_HERDR_SOCKET_PATH",
+    "BUZZ_FIRSTMATE_HERDR_WORKSPACE_ID",
+    "BUZZ_FIRSTMATE_HERDR_ROOT_TAB_ID",
+    "BUZZ_FIRSTMATE_HERDR_ROOT_PANE_ID",
+    "BUZZ_FIRSTMATE_HERDR_CONTRACT_VERSION",
+    "BUZZ_FIRSTMATE_HERDR_BINARY",
+    "BUZZ_ACP_SESSION_SCOPE",
     // Security gates: respond-to mode + allowlist + deployment allowlist +
     // legacy owner-only fallback. Overriding would make the running agent's
     // gate diverge from the saved/UI-visible settings.

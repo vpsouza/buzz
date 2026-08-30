@@ -16,13 +16,22 @@ pub(super) fn requirements(
     setup_copy: &str,
     runtime: &KnownAcpRuntime,
 ) -> Vec<Requirement> {
+    requirements_with_binary(probe_args, setup_copy, runtime, None)
+}
+
+pub(super) fn requirements_with_binary(
+    probe_args: &[&str],
+    setup_copy: &str,
+    runtime: &KnownAcpRuntime,
+    trusted_probe_binary: Option<&Path>,
+) -> Vec<Requirement> {
     let adapter_result = runtime
         .commands
         .iter()
         .find_map(|cmd| find_command(cmd).map(|path| (*cmd, path)));
     let underlying_cli_found = runtime
         .underlying_cli
-        .map(|cli| find_command(cli).is_some())
+        .map(|cli| trusted_probe_binary.is_some() || find_command(cli).is_some())
         .unwrap_or(false);
 
     let (availability, _cmd, adapter_path) =
@@ -39,7 +48,10 @@ pub(super) fn requirements(
 
     match availability {
         AcpAvailabilityStatus::Available => {
-            let Some(binary_path) = resolve_command(probe_args[0]) else {
+            let Some(binary_path) = trusted_probe_binary
+                .map(Path::to_path_buf)
+                .or_else(|| resolve_command(probe_args[0]))
+            else {
                 return vec![missing_requirement(
                     probe_args,
                     setup_copy,

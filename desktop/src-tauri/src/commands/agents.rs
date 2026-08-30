@@ -1,5 +1,8 @@
+use std::{fs, path::Path, process::Command};
+
 use nostr::{Keys, ToBech32};
 use tauri::{AppHandle, State};
+use uuid::Uuid;
 
 use super::managed_agent_definition::validate_create_definition;
 
@@ -13,7 +16,8 @@ use crate::{
         stop_managed_agent_workspace_pair, sync_managed_agent_processes, try_regenerate_nest,
         validate_provider_config, BackendKind, CreateManagedAgentRequest,
         CreateManagedAgentResponse, ManagedAgentRecord, ManagedAgentSummary, RelayMeshConfig,
-        DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM, DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
+        SessionScope, DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM,
+        DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
     },
     relay::{relay_ws_url_with_override, sync_managed_agent_profile},
     util::now_iso,
@@ -24,6 +28,150 @@ use crate::{
 pub(super) fn workspace_owner_hex(state: &AppState) -> Result<String, String> {
     let keys = state.keys.lock().map_err(|e| e.to_string())?;
     Ok(keys.public_key().to_hex())
+}
+
+/// Validate a FirstMate home before submit and return the canonical path the
+/// record will persist. The create/update boundaries repeat this validation;
+/// this command exists only to make path feedback immediate in the dialog.
+#[tauri::command]
+pub fn validate_firstmate_home_path(path: std::path::PathBuf) -> Result<String, String> {
+    let canonical = crate::managed_agents::validate_working_directory(Some(path))?
+        .ok_or_else(|| "FirstMate home is required".to_string())?;
+    crate::managed_agents::working_directory::validate_firstmate_home(&canonical)?;
+    Ok(canonical.to_string_lossy().into_owned())
+}
+
+const FIRSTMATE_REPOSITORY_URL: &str = "git@github.com:check-rep-fit/firstmate.git";
+
+/// Open the native folder picker and return its canonical selected directory.
+/// Validation is deliberately separate: an empty/non-FirstMate directory must
+/// reach the UI so it can offer to clone a fresh FirstMate there.
+#[tauri::command]
+pub async fn pick_firstmate_home(app: AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |path| {
+        let _ = tx.send(path);
+    });
+    let Some(path) = rx
+        .await
+        .map_err(|_| "FirstMate folder picker did not return a selection".to_string())?
+    else {
+        return Ok(None);
+    };
+    let canonical = crate::managed_agents::validate_working_directory(Some(
+        path.as_path()
+            .ok_or_else(|| "FirstMate folder picker returned an invalid path".to_string())?
+            .to_path_buf(),
+    ))?
+    .ok_or_else(|| "FirstMate home is required".to_string())?;
+    Ok(Some(canonical.to_string_lossy().into_owned()))
+}
+
+fn clone_firstmate_home_from(
+    destination: &Path,
+    repository: &str,
+    git: &Path,
+) -> Result<String, String> {
+    if !destination.is_absolute() {
+        return Err("FirstMate clone destination must be an absolute path".to_string());
+    }
+    let leaf = destination
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "FirstMate clone destination needs a directory name".to_string())?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "FirstMate clone destination needs a parent directory".to_string())?
+        .canonicalize()
+        .map_err(|error| format!("canonicalize FirstMate clone parent: {error}"))?;
+    let destination = parent.join(leaf);
+    if destination.exists() {
+        let metadata = destination
+            .symlink_metadata()
+            .map_err(|error| format!("inspect FirstMate clone destination: {error}"))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err("FirstMate clone destination must be a real directory".to_string());
+        }
+        if destination
+            .read_dir()
+            .map_err(|error| format!("read FirstMate clone destination: {error}"))?
+            .next()
+            .is_some()
+        {
+            return Err(
+                "This folder is not empty. Choose an existing FirstMate home or an empty folder to clone into."
+                    .to_string(),
+            );
+        }
+    }
+
+    let staging = parent.join(format!(".buzz-firstmate-clone-{}", Uuid::new_v4()));
+    let clone_result = (|| -> Result<(), String> {
+        let output = Command::new(git)
+            .args(["clone", "--origin", "origin", repository])
+            .arg(&staging)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_SSH_COMMAND", "/usr/bin/ssh -o BatchMode=yes")
+            .env_remove("GIT_ASKPASS")
+            .env_remove("SSH_ASKPASS")
+            .output()
+            .map_err(|error| format!("start FirstMate git clone: {error}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "Could not clone FirstMate from {repository}: {}",
+                stderr.trim()
+            ));
+        }
+        fs::create_dir_all(staging.join("state"))
+            .map_err(|error| format!("initialize FirstMate state directory: {error}"))?;
+        crate::managed_agents::working_directory::validate_firstmate_home(&staging)?;
+
+        if destination.exists() {
+            if destination
+                .read_dir()
+                .map_err(|error| format!("recheck FirstMate clone destination: {error}"))?
+                .next()
+                .is_some()
+            {
+                return Err("FirstMate clone destination changed while cloning".to_string());
+            }
+            fs::remove_dir(&destination)
+                .map_err(|error| format!("prepare empty FirstMate destination: {error}"))?;
+        }
+        fs::rename(&staging, &destination)
+            .map_err(|error| format!("publish cloned FirstMate home: {error}"))?;
+        Ok(())
+    })();
+    if let Err(error) = clone_result {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    let canonical = destination
+        .canonicalize()
+        .map_err(|error| format!("canonicalize cloned FirstMate home: {error}"))?;
+    crate::managed_agents::working_directory::validate_firstmate_home(&canonical)?;
+    Ok(canonical.to_string_lossy().into_owned())
+}
+
+/// Clone the official FirstMate repository into an absent or empty directory.
+/// The clone is staged and validated before an atomic rename; occupied folders
+/// are never overwritten and interactive credential prompts are disabled.
+#[tauri::command]
+pub async fn clone_firstmate_home(path: std::path::PathBuf) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let git = crate::managed_agents::find_via_login_shell("git")
+            .or_else(|| {
+                let path = std::path::PathBuf::from("/usr/bin/git");
+                path.is_file().then_some(path)
+            })
+            .ok_or_else(|| "Git is required to clone FirstMate".to_string())?;
+        clone_firstmate_home_from(&path, FIRSTMATE_REPOSITORY_URL, &git)
+    })
+    .await
+    .map_err(|error| format!("FirstMate clone task failed: {error}"))?
 }
 
 #[path = "agents_pending.rs"]
@@ -260,6 +408,24 @@ pub(super) async fn start_local_agent_with_preflight(
     let workspace_owner =
         crate::relay::bind_expected_signer(expected_signer_pubkey, workspace_owner_hex(state)?)?;
 
+    // Serialize the final preflight-to-register transition with app-launch
+    // restore, explicit pair starts, reconciliation, and shutdown. The async
+    // checks above intentionally run outside this lock; everything from the
+    // authoritative record reload through receipt persistence must be atomic.
+    // Without this guard, clicking Start while start-on-launch is still
+    // registering can spawn a second sidecar, overwrite the first receipt, and
+    // later let reconciliation reap the healthy process.
+    let _transition = state
+        .managed_agent_runtime_transition
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if state
+        .shutdown_started
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err("desktop shutdown has started".into());
+    }
+
     let _store_guard = state
         .managed_agents_store_lock
         .lock()
@@ -269,6 +435,30 @@ pub(super) async fn start_local_agent_with_preflight(
         .managed_agent_processes
         .lock()
         .map_err(|e| e.to_string())?;
+    // A FirstMate home is a mutable primary authority. Refuse a second live
+    // agent-scoped process even when it was configured through an older build
+    // or an IPC caller instead of the Desktop form.
+    let target = records
+        .iter()
+        .find(|record| record.pubkey == pubkey)
+        .ok_or_else(|| format!("agent {pubkey} not found"))?;
+    if target.session_scope == SessionScope::Agent {
+        let target_home = crate::managed_agents::validate_record_working_directory(target)?;
+        if let Some(target_home) = target_home {
+            if let Some(other) = records.iter().find(|other| {
+                other.pubkey != target.pubkey
+                    && other.session_scope == SessionScope::Agent
+                    && other.working_directory.as_ref() == Some(&target_home)
+                    && !crate::managed_agents::managed_agent_runtime_keys(&runtimes, &other.pubkey)
+                        .is_empty()
+            }) {
+                return Err(format!(
+                    "FirstMate home is already owned by live agent {}",
+                    other.name
+                ));
+            }
+        }
+    }
     let record = find_managed_agent_mut(&mut records, pubkey)?;
     if record.backend != BackendKind::Local {
         return Err(format!("agent {pubkey} is no longer a local agent"));
@@ -378,10 +568,19 @@ pub async fn list_managed_agents(app: AppHandle) -> Result<Vec<ManagedAgentSumma
 
 #[tauri::command]
 pub async fn create_managed_agent(
-    input: CreateManagedAgentRequest,
+    mut input: CreateManagedAgentRequest,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CreateManagedAgentResponse, String> {
+    // FirstMate is an explicit product mode, not a convenient spelling of an
+    // agent-scoped session. Normalize its non-negotiable execution contract at
+    // the trust boundary so API callers cannot assemble a mixed configuration.
+    if input.firstmate {
+        input.session_scope = SessionScope::Agent;
+        input.parallelism = Some(1);
+    } else if input.session_scope == SessionScope::Agent {
+        return Err("agent session scope is reserved for explicit FirstMate mode".to_string());
+    }
     let name = input.name.trim().to_string();
     let requested_persona_id = input
         .persona_id
@@ -396,6 +595,25 @@ pub async fn create_managed_agent(
         }
     }
     crate::managed_agents::validate_user_env_keys(&input.env_vars)?;
+    let working_directory =
+        crate::managed_agents::validate_working_directory(input.working_directory.clone())?;
+    if input.firstmate {
+        let home = working_directory.as_deref().ok_or_else(|| {
+            "agent-scoped sessions require a FirstMate working directory".to_string()
+        })?;
+        let installed = crate::managed_agents::firstmate_bridge::ensure_firstmate_bridge(home)?;
+        if !installed.is_empty() {
+            eprintln!(
+                "buzz-desktop: installed FirstMate Buzz bridge into {}: {}",
+                home.display(),
+                installed.join(", ")
+            );
+        }
+        crate::managed_agents::working_directory::validate_firstmate_home(home)?;
+        if input.backend != BackendKind::Local {
+            return Err("FirstMate agents must use the local backend".to_string());
+        }
+    }
 
     // Validate & normalize the respond-to allowlist BEFORE any side effects.
     // The harness has its own validator (buzz-acp/src/config.rs) but we want
@@ -665,7 +883,14 @@ pub async fn create_managed_agent(
             // 0 or None → harness uses its own default (320s idle, 3600s max), and the CLI also clamps 0 → minimum.
             idle_timeout_seconds: input.idle_timeout_seconds.filter(|s| *s > 0),
             max_turn_duration_seconds: input.max_turn_duration_seconds.filter(|s| *s > 0),
-            parallelism: minted.parallelism.unwrap_or(DEFAULT_AGENT_PARALLELISM),
+            parallelism: if input.firstmate {
+                1
+            } else {
+                minted.parallelism.unwrap_or(DEFAULT_AGENT_PARALLELISM)
+            },
+            working_directory,
+            session_scope: input.session_scope,
+            firstmate: input.firstmate,
             system_prompt: snapshot_prompt.or_else(|| {
                 input
                     .system_prompt

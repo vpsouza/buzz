@@ -71,6 +71,73 @@ pub use lifecycle::{kill_stale_tracked_processes, sync_managed_agent_processes};
 mod spawn_key; // production spawn-key derivation + its regressions
 pub(crate) use spawn_key::bound_runtime_key;
 
+/// Codex's default `agent` mode does not permit connecting to the broker-owned
+/// Herdr Unix socket. Agent-scoped sessions are validated FirstMate homes, so
+/// their trusted Desktop launch is allowed to use this non-interactive mode.
+const FIRSTMATE_INITIAL_AGENT_MODE: &str = "agent-full-access";
+
+#[cfg(target_os = "macos")]
+fn bundled_codex_cli(agent_command: &str) -> Option<std::path::PathBuf> {
+    let adapter_entry = std::fs::canonicalize(agent_command).ok()?;
+    let package_root = adapter_entry.parent()?.parent()?;
+    let (package, triple) = match std::env::consts::ARCH {
+        "aarch64" => ("codex-darwin-arm64", "aarch64-apple-darwin"),
+        "x86_64" => ("codex-darwin-x64", "x86_64-apple-darwin"),
+        _ => return None,
+    };
+    let candidate = package_root
+        .join("node_modules/@openai")
+        .join(package)
+        .join("vendor")
+        .join(triple)
+        .join("bin")
+        .join("codex");
+    let resolved = std::fs::canonicalize(&candidate).ok()?;
+    resolved.is_file().then_some(resolved)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn bundled_codex_cli(_agent_command: &str) -> Option<std::path::PathBuf> {
+    None
+}
+
+fn validated_firstmate_initial_agent_mode(
+    record: &ManagedAgentRecord,
+    validated_home: Option<&std::path::Path>,
+) -> Result<Option<&'static str>, String> {
+    // FirstMate identity is an explicit persisted authority boundary.
+    // SessionScope only controls ACP routing and cannot grant full access.
+    if !record.firstmate {
+        return Ok(None);
+    }
+    if record.backend != crate::managed_agents::BackendKind::Local {
+        return Err("FirstMate agents must use the local backend".to_string());
+    }
+    let home = validated_home.ok_or_else(|| {
+        "agent-scoped FirstMate mode requires a validated working directory".to_string()
+    })?;
+    let persisted_home = record.working_directory.as_deref().ok_or_else(|| {
+        "agent-scoped FirstMate mode requires a persisted working directory".to_string()
+    })?;
+    let canonical_persisted_home = std::fs::canonicalize(persisted_home)
+        .map_err(|error| format!("failed to canonicalize FirstMate working directory: {error}"))?;
+    if canonical_persisted_home != home {
+        return Err(
+            "validated FirstMate home does not match the persisted working directory".to_string(),
+        );
+    }
+    super::working_directory::validate_firstmate_home(home)?;
+    // Codex alone understands this execution-mode contract. Claude keeps its
+    // native autonomy model, while receiving the same FirstMate attestation.
+    Ok(known_acp_runtime(&record.agent_command)
+        .filter(|runtime| runtime.id == "codex")
+        .map(|_| FIRSTMATE_INITIAL_AGENT_MODE))
+}
+
+fn remove_inherited_initial_agent_mode(command: &mut std::process::Command) {
+    command.env_remove("INITIAL_AGENT_MODE");
+}
+
 /// Classify an agent's persona against the live catalog for the Agents-menu
 /// drift indicator. Returns `(out_of_date, orphaned)`.
 ///
@@ -314,6 +381,9 @@ pub fn build_managed_agent_summary(
         idle_timeout_seconds: record.idle_timeout_seconds,
         max_turn_duration_seconds: record.max_turn_duration_seconds,
         parallelism: record.parallelism,
+        working_directory: record.working_directory.clone(),
+        session_scope: record.session_scope,
+        firstmate: record.firstmate,
         system_prompt: effective_prompt,
         avatar_url: record.avatar_url.clone(),
         model: effective_model,
@@ -520,7 +590,22 @@ pub fn spawn_agent_child(
     );
 
     let mut command = std::process::Command::new(&resolved_acp_command);
-    if let Some(home) = super::default_agent_workdir() {
+    let firstmate_home = super::validate_record_working_directory(record)?;
+    if record.firstmate {
+        let home = firstmate_home
+            .as_deref()
+            .ok_or_else(|| "FirstMate agent is missing its working directory".to_string())?;
+        let installed = super::firstmate_bridge::ensure_firstmate_bridge(home)?;
+        if !installed.is_empty() {
+            eprintln!(
+                "buzz-desktop: installed FirstMate Buzz bridge into {}: {}",
+                home.display(),
+                installed.join(", ")
+            );
+        }
+    }
+    let workdir = firstmate_home.clone().or_else(super::default_agent_workdir);
+    if let Some(home) = workdir {
         command.current_dir(home);
     }
     command.stdin(std::process::Stdio::null());
@@ -547,6 +632,14 @@ pub fn spawn_agent_child(
     // Enable MCP hook tools (_Stop, _PostCompact) for agents that need them.
     // Uses "*" because build_mcp_servers() hard-codes the server name to "buzz-mcp".
     let runtime_meta = known_acp_runtime(effective_command);
+    let firstmate_codex_cli =
+        if record.firstmate && runtime_meta.is_some_and(|runtime| runtime.id == "codex") {
+            Some(bundled_codex_cli(&resolved_agent_command).ok_or_else(|| {
+                "FirstMate Codex runtime is missing its bundled Codex CLI".to_string()
+            })?)
+        } else {
+            None
+        };
     if runtime_meta.is_some_and(|r| r.mcp_hooks) {
         command.env("MCP_HOOK_SERVERS", "*");
     }
@@ -577,8 +670,15 @@ pub fn spawn_agent_child(
 
         // Construct EffectiveAgentEnv from the descriptor computed above — no second
         // resolver call; the descriptor's env is already the fully layered result.
+        let mut readiness_env = descriptor.env.clone();
+        if let Some(codex_cli) = &firstmate_codex_cli {
+            readiness_env.insert(
+                "BUZZ_FIRSTMATE_CODEX_BINARY".to_string(),
+                codex_cli.display().to_string(),
+            );
+        }
         let effective = EffectiveAgentEnv {
-            env: descriptor.env.clone(),
+            env: readiness_env,
             config_file_path: runtime_meta.and_then(|r| r.config_file_path),
             effective_command: descriptor.command.clone(),
         };
@@ -677,8 +777,23 @@ pub fn spawn_agent_child(
     if let Some(max_dur) = record.max_turn_duration_seconds {
         command.env("BUZZ_ACP_MAX_TURN_DURATION", max_dur.to_string());
     }
-    let acp_n = super::acp_agents_value(effective_command, record.parallelism);
+    let acp_n = if record.session_scope == crate::managed_agents::SessionScope::Agent {
+        "1".to_string()
+    } else {
+        super::acp_agents_value(effective_command, record.parallelism)
+    };
     command.env("BUZZ_ACP_AGENTS", acp_n);
+    command.env_remove("BUZZ_FIRSTMATE_HOME");
+    command.env_remove("BUZZ_FIRSTMATE_HARNESS_PID");
+    command.env_remove("BUZZ_FIRSTMATE_SUPERVISOR_GENERATION");
+    command.env_remove("BUZZ_FIRSTMATE_CODEX_BINARY");
+    command.env_remove("BUZZ_DESKTOP_PID");
+    command.env_remove("FM_HOME");
+    command.env_remove("BUZZ_ACP_SESSION_SCOPE");
+    // Never allow a Desktop, shell, or previous launch to choose Codex's
+    // access mode implicitly. The validated FirstMate branch below is the
+    // only code that may put it back.
+    remove_inherited_initial_agent_mode(&mut command);
     command.env("BUZZ_ACP_MULTIPLE_EVENT_HANDLING", "steer");
     command.env("BUZZ_ACP_DEDUP", "queue");
     if let Some(meta) = runtime_meta {
@@ -707,7 +822,10 @@ pub fn spawn_agent_child(
     // spawn semantics in lock-step (see `EffectiveAgentConfig::relay_mesh_model_id`).
     #[cfg(feature = "mesh-llm")]
     let mesh_model_id = effective_cfg.relay_mesh_model_id();
-    let effective_prompt = effective_cfg.system_prompt.value;
+    let effective_prompt = super::spawn_snapshot::effective_system_prompt_for_scope(
+        record,
+        effective_cfg.system_prompt.value.as_deref(),
+    );
     let effective_model = effective_cfg.model.value;
     let effective_provider = effective_cfg.provider.value;
 
@@ -808,6 +926,55 @@ pub fn spawn_agent_child(
     // reserved-key filtered. Written last so user-explicit values win over Buzz-set env.
     for (key, value) in &descriptor.env {
         command.env(key, value);
+    }
+    // Written after all user/persona env and reserved above. buzz-acp watches
+    // this process and performs its normal graceful shutdown if the Desktop
+    // is killed before Tauri can run the application shutdown hook.
+    command.env("BUZZ_DESKTOP_PID", std::process::id().to_string());
+    // Do not leak a parent-process attestation to an unrelated managed agent.
+    command.env_remove("BUZZ_FIRSTMATE_PERSISTED");
+    if record.firstmate {
+        let home = firstmate_home
+            .as_deref()
+            .ok_or_else(|| "FirstMate agents require a FirstMate working directory".to_string())?;
+        // `INITIAL_AGENT_MODE=agent` is Codex's default and cannot connect to
+        // the Desktop-broker-validated Herdr socket. Set this after all
+        // descriptor env is applied; it is a trusted FirstMate-only launch
+        // policy, never a persona or agent override.
+        if let Some(initial_agent_mode) =
+            validated_firstmate_initial_agent_mode(record, Some(home))?
+        {
+            command.env("INITIAL_AGENT_MODE", initial_agent_mode);
+        }
+        command.env("BUZZ_FIRSTMATE_PERSISTED", "1");
+        if let Some(codex_cli) = &firstmate_codex_cli {
+            command.env("BUZZ_FIRSTMATE_CODEX_BINARY", codex_cli);
+        }
+        // This must happen after descriptor.env: raw HERDR_* is not reserved
+        // (it is meaningful to non-FirstMate runtimes), so only the FirstMate
+        // boundary removes it. HERDR_ENV alone is never authority.
+        super::herdr_fleet_manager::HerdrFleetManager::scrub_inherited_herdr_env(&mut command);
+        // Multiplexer selection is part of the fully layered runtime env. A
+        // keyed instance can inherit it from its persona after reconciliation,
+        // so `record.env_vars` alone is not authoritative here.
+        match super::herdr_fleet_manager::FirstMateMultiplexer::from_agent_env(&descriptor.env)? {
+            super::herdr_fleet_manager::FirstMateMultiplexer::Tmux => {
+                command.env("BUZZ_FIRSTMATE_HOME", home);
+            }
+            super::herdr_fleet_manager::FirstMateMultiplexer::Herdr => {
+                let endpoint = super::herdr_fleet_manager::ensure_firstmate_herdr_endpoint(
+                    app,
+                    &record.pubkey,
+                    home,
+                )?;
+                for (key, value) in endpoint {
+                    command.env(key, value);
+                }
+            }
+        }
+        command.env("BUZZ_ACP_SESSION_SCOPE", "agent");
+    } else {
+        command.env("BUZZ_ACP_SESSION_SCOPE", "channel");
     }
 
     // B5: carry persisted effort; harness resolves thought_level configId at first session.
@@ -966,6 +1133,14 @@ pub fn start_managed_agent_process(
 
     // Scalar PIDs are migration-only and never establish pair liveness.
     record.runtime_pid = None;
+
+    // A valid receipt can outlive its in-memory entry briefly while launch
+    // restore and UI reconciliation converge. Never spawn over that receipt:
+    // doing so loses the only authoritative PID and leaves two FirstMates
+    // contending for the same supervisor/home. The caller holds the runtime
+    // transition lock, so replacing an untracked prior process and registering
+    // its successor is one atomic lifecycle operation.
+    terminate_untracked_pair_runtime(app, &key)?;
 
     let mut process = spawn_agent_child(app, record, &key.relay_url, false, owner_hex)?;
     let now = now_iso();

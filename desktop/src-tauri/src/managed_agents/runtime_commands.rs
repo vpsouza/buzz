@@ -15,7 +15,7 @@ use crate::app_state::AppState;
 
 const STATUS_EVENT: &str = "managed-agent-runtime-status";
 
-fn status_for(
+pub(super) fn status_for(
     app: &AppHandle,
     record: &super::ManagedAgentRecord,
     key: &ManagedAgentRuntimeKey,
@@ -73,7 +73,7 @@ fn status_for_with(
     }
 }
 
-fn emit_status(app: &AppHandle, status: &ManagedAgentRuntimeStatus) {
+pub(super) fn emit_status(app: &AppHandle, status: &ManagedAgentRuntimeStatus) {
     let _ = app.emit(STATUS_EVENT, status);
 }
 
