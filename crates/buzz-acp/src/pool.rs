@@ -34,7 +34,7 @@ use crate::acp::{
     model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer,
     ModelSwitchMethod, StopReason, SystemPromptTransport,
 };
-use crate::config::{compose_session_title, DedupMode, PermissionMode};
+use crate::config::{compose_session_title, DedupMode, PermissionMode, SessionScope};
 use crate::observer;
 use crate::prompt_project::{pick_authoritative_project_home, PromptProjectInfo};
 use crate::queue::{
@@ -742,6 +742,34 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
+    /// Determines whether all channel origins share one ACP session key.
+    pub session_scope: SessionScope,
+    /// Monotonic per-channel count of self-authored message events observed
+    /// from the relay. Agent-scoped turns snapshot this counter so the runtime
+    /// can distinguish a real Buzz reply from text stranded in ACP telemetry.
+    pub outbound_messages: OutboundMessageTracker,
+}
+
+#[derive(Clone, Default)]
+pub struct OutboundMessageTracker(Arc<Mutex<HashMap<Uuid, u64>>>);
+
+impl OutboundMessageTracker {
+    pub fn snapshot(&self, channel_id: Uuid) -> u64 {
+        self.0
+            .lock()
+            .expect("outbound message tracker mutex poisoned")
+            .get(&channel_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn observe(&self, channel_id: Uuid) {
+        let mut counts = self
+            .0
+            .lock()
+            .expect("outbound message tracker mutex poisoned");
+        *counts.entry(channel_id).or_default() += 1;
+    }
 }
 
 impl AgentPool {
@@ -1877,13 +1905,13 @@ pub async fn run_prompt_task(
 ) {
     // Is this a channel prompt or a heartbeat?
     let source = match &batch {
-        Some(b) => PromptSource::Channel(b.channel_id),
+        Some(b) => PromptSource::Channel(match ctx.session_scope {
+            SessionScope::Channel => b.channel_id,
+            SessionScope::Agent => Uuid::nil(),
+        }),
         None => PromptSource::Heartbeat,
     };
-    let observer_channel_id = match &source {
-        PromptSource::Channel(channel_id) => Some(*channel_id),
-        PromptSource::Heartbeat => None,
-    };
+    let observer_channel_id = batch.as_ref().map(|b| b.channel_id);
     let turn_started_at = chrono::Utc::now().to_rfc3339();
     agent.acp.set_observer_context(observer::context_for_turn(
         observer_channel_id,
@@ -2063,7 +2091,7 @@ pub async fn run_prompt_task(
     // canvas DM check uses — see `resolve_new_session_channel_context`.
     let mut title_channel: Option<String> = None;
     let mut origin_channel_type: Option<String> = None;
-    if let PromptSource::Channel(cid) = &source {
+    if let (PromptSource::Channel(cid), Some(origin_channel_id)) = (&source, observer_channel_id) {
         let is_new_channel_session = !agent.state.sessions.contains_key(cid);
         let needs_canvas = is_new_channel_session && !agent.state.canvas_sections.contains_key(cid);
         if is_new_channel_session {
@@ -2073,12 +2101,14 @@ pub async fn run_prompt_task(
             origin_channel_type = resolved_channel_type;
             if let Some(owner) = ctx.agent_owner_pubkey.as_ref() {
                 huddle_instructions =
-                    fetch_huddle_instructions(*cid, owner, &ctx.rest_client).await;
+                    fetch_huddle_instructions(origin_channel_id, owner, &ctx.rest_client).await;
             }
             // A confirmed DM never receives a canvas section; an undeterminable
             // channel type fails closed as a DM for the same reason.
             if needs_canvas && !is_dm {
-                if let Some(section) = fetch_canvas_section(*cid, &ctx.rest_client).await {
+                if let Some(section) =
+                    fetch_canvas_section(origin_channel_id, &ctx.rest_client).await
+                {
                     pending_canvas = Some((*cid, section));
                 }
             }
@@ -2121,7 +2151,7 @@ pub async fn run_prompt_task(
                         huddle_instructions: huddle_instructions.as_deref(),
                         canvas: agent_canvas.as_deref(),
                         name: title_channel.as_deref(),
-                        id: Some(*cid),
+                        id: observer_channel_id,
                         channel_type: origin_channel_type.as_deref(),
                     },
                 )
@@ -2602,6 +2632,13 @@ pub async fn run_prompt_task(
         "turn starting for {}",
         prompt_label(&source)
     );
+    let outbound_before = if ctx.session_scope == SessionScope::Agent {
+        batch
+            .as_ref()
+            .map(|batch| ctx.outbound_messages.snapshot(batch.channel_id))
+    } else {
+        None
+    };
 
     // When control_rx is Some (channel tasks), wrap the prompt in select! so
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
@@ -2771,6 +2808,15 @@ pub async fn run_prompt_task(
                             Some(buzz_core::agent_turn_metric::StopReason::EndTurn),
                         )
                         .await;
+                        let fallback_content = agent.acp.take_turn_agent_message();
+                        publish_agent_scope_reply_fallback(
+                            &ctx,
+                            &source,
+                            batch.as_ref(),
+                            outbound_before,
+                            fallback_content,
+                        )
+                        .await;
                         send_prompt_result(
                             &result_tx,
                             &turn_id,
@@ -2843,6 +2889,16 @@ pub async fn run_prompt_task(
                 &session_id,
                 &turn_id,
                 Some(core_stop),
+            )
+            .await;
+
+            let fallback_content = agent.acp.take_turn_agent_message();
+            publish_agent_scope_reply_fallback(
+                &ctx,
+                &source,
+                batch.as_ref(),
+                outbound_before,
+                fallback_content,
             )
             .await;
 
@@ -4796,6 +4852,90 @@ pub(crate) async fn post_failure_notice(
     }
 }
 
+/// Publish the ACP assistant text when an agent-scoped turn produced an answer
+/// but no self-authored channel message. FirstMate sessions intentionally keep
+/// one continuous ACP session, so losing the final answer into observer-only
+/// telemetry is worse than a best-effort fallback. The relay-observed counter
+/// prevents duplicates when the agent already replied through CLI or MCP.
+async fn publish_agent_scope_reply_fallback(
+    ctx: &PromptContext,
+    source: &PromptSource,
+    batch: Option<&FlushBatch>,
+    outbound_before: Option<u64>,
+    content: Option<String>,
+) {
+    if ctx.session_scope != SessionScope::Agent {
+        return;
+    }
+    let (Some(channel_id), Some(batch), Some(before), Some(content)) = (
+        agent_scope_reply_channel(source, batch),
+        batch,
+        outbound_before,
+        content,
+    ) else {
+        return;
+    };
+
+    // Let a CLI/MCP publish echo through the relay subscription before deciding
+    // it was absent. This delay is paid only by the agent-scoped fail-safe.
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    if ctx.outbound_messages.snapshot(channel_id) > before {
+        return;
+    }
+
+    let thread_ref = batch.events.last().and_then(|event| {
+        let tags = crate::queue::parse_thread_tags(&event.event);
+        tags.root_event_id.and_then(|root| {
+            let root_event_id = nostr::EventId::from_hex(&root).ok()?;
+            Some(buzz_sdk::ThreadRef {
+                root_event_id,
+                parent_event_id: root_event_id,
+            })
+        })
+    });
+    let builder = match buzz_sdk::build_message(
+        channel_id,
+        &content,
+        thread_ref.as_ref(),
+        &[],
+        false,
+        &[],
+    ) {
+        Ok(builder) => builder,
+        Err(error) => {
+            tracing::warn!(channel = %channel_id, "FirstMate fallback reply build failed: {error}");
+            return;
+        }
+    };
+    let event = match builder.sign_with_keys(&ctx.agent_keys) {
+        Ok(event) => event,
+        Err(error) => {
+            tracing::warn!(channel = %channel_id, "FirstMate fallback reply signing failed: {error}");
+            return;
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(5), ctx.rest_client.submit_event(&event)).await {
+        Ok(Ok(_)) => tracing::warn!(
+            channel = %channel_id,
+            "FirstMate turn ended without a Buzz message; published ACP final text as fallback"
+        ),
+        Ok(Err(error)) => tracing::warn!(
+            channel = %channel_id,
+            "FirstMate fallback reply publish failed: {error}"
+        ),
+        Err(_) => tracing::warn!(
+            channel = %channel_id,
+            "FirstMate fallback reply publish timed out"
+        ),
+    }
+}
+
+fn agent_scope_reply_channel(source: &PromptSource, batch: Option<&FlushBatch>) -> Option<Uuid> {
+    matches!(source, PromptSource::Channel(_))
+        .then(|| batch.map(|batch| batch.channel_id))
+        .flatten()
+}
+
 /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
 ///
 /// Queries kind:7 reactions by our pubkey targeting the event, finds the matching
@@ -4924,6 +5064,21 @@ mod tests {
             args: vec![],
             env: vec![],
         }
+    }
+
+    #[test]
+    fn agent_scope_fallback_uses_origin_channel_not_synthetic_session_channel() {
+        let origin = Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id: origin,
+            events: Vec::new(),
+            cancelled_events: Vec::new(),
+            cancel_reason: None,
+        };
+        assert_eq!(
+            agent_scope_reply_channel(&PromptSource::Channel(Uuid::nil()), Some(&batch)),
+            Some(origin)
+        );
     }
 
     #[test]
@@ -8236,6 +8391,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             memory_enabled: false,
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
+            session_scope: SessionScope::Channel,
+            outbound_messages: OutboundMessageTracker::default(),
         }
     }
 

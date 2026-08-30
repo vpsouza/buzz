@@ -60,6 +60,18 @@ pub enum DedupMode {
     Queue,
 }
 
+/// Determines whether ACP sessions and queued turns are isolated per Buzz
+/// channel (the historical default) or shared by the whole managed agent.
+///
+/// `Agent` is intentionally coupled to a one-worker pool: ACP adapters own
+/// mutable session state, so multiple workers would create competing primaries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum SessionScope {
+    #[default]
+    Channel,
+    Agent,
+}
+
 /// How to handle new @mentions while a turn is already in-flight for that channel.
 #[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
 pub enum MultipleEventHandling {
@@ -299,6 +311,11 @@ pub struct CliArgs {
           value_parser = clap::value_parser!(u32).range(1..=32))]
     pub agents: u32,
 
+    /// Scope ACP session affinity and the turn FIFO by channel (default) or
+    /// by this managed agent.
+    #[arg(long, env = "BUZZ_ACP_SESSION_SCOPE", default_value = "channel")]
+    pub session_scope: SessionScope,
+
     /// Seconds between heartbeat prompts. 0 = disabled.
     #[arg(long, env = "BUZZ_ACP_HEARTBEAT_INTERVAL", default_value_t = 0)]
     pub heartbeat_interval: u64,
@@ -524,6 +541,7 @@ pub struct Config {
     pub idle_timeout_secs: u64,
     pub max_turn_duration_secs: u64,
     pub agents: u32,
+    pub session_scope: SessionScope,
     pub heartbeat_interval_secs: u64,
     /// Seconds between per-turn liveness pings. 0 = disabled. Distinct from
     /// `heartbeat_interval_secs` (agent self-prompting) — this is the desktop
@@ -879,7 +897,7 @@ impl Config {
             .replace_range(.., &"0".repeat(args.private_key.len()));
         args.private_key.clear();
 
-        let system_prompt = if let Some(text) = args.system_prompt {
+        let mut system_prompt = if let Some(text) = args.system_prompt {
             Some(text)
         } else if let Some(ref path) = args.system_prompt_file {
             Some(std::fs::read_to_string(path)?)
@@ -891,6 +909,25 @@ impl Config {
             return Err(ConfigError::ConfigFile(
                 "heartbeat interval must be 0 (disabled) or ≥10 seconds".into(),
             ));
+        }
+
+        if args.session_scope == SessionScope::Agent && args.agents != 1 {
+            return Err(ConfigError::ConfigFile(
+                "session_scope=agent requires BUZZ_ACP_AGENTS=1".into(),
+            ));
+        }
+
+        if args.session_scope == SessionScope::Agent
+            && crate::acp::firstmate_harness_bridge_is_active()
+        {
+            let bridge = format!(
+                "[FirstMate Buzz tool bridge]\nACP tool commands may be executed by a desktop broker that inherits an unrelated FM_HOME. Before mutable work, bootstrap this FirstMate home exactly once. If bin/fm-session-start.sh exists and is executable, run:\n\nenv FM_HOME=\"$PWD\" BUZZ_FIRSTMATE_HOME=\"$PWD\" BUZZ_FIRSTMATE_HARNESS_PID={} bin/fm-session-start.sh\n\nIf that helper does not exist, this is a legacy FirstMate home: follow the bootstrap, lock, wake-drain, and recovery sequence documented by this home's AGENTS.md instead. Preserve the broker-provided FM_HOME, BUZZ_FIRSTMATE_HOME, and BUZZ_FIRSTMATE_HARNESS_PID; do not substitute another home or pid, and do not treat the missing modern helper as a bridge failure.",
+                std::process::id()
+            );
+            system_prompt = Some(match system_prompt {
+                Some(prompt) => format!("{prompt}\n\n{bridge}"),
+                None => bridge,
+            });
         }
 
         if args.turn_liveness_secs > 0 && args.turn_liveness_secs < 5 {
@@ -1100,6 +1137,7 @@ impl Config {
             idle_timeout_secs,
             max_turn_duration_secs,
             agents: args.agents,
+            session_scope: args.session_scope,
             heartbeat_interval_secs: heartbeat_interval,
             turn_liveness_secs,
             heartbeat_prompt,
@@ -1164,7 +1202,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} session_scope={:?} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1173,6 +1211,7 @@ impl Config {
             self.idle_timeout_secs,
             self.max_turn_duration_secs,
             self.agents,
+            self.session_scope,
             self.heartbeat_interval_secs,
             self.subscribe_mode,
             self.dedup_mode,
@@ -1481,6 +1520,7 @@ mod tests {
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
+            session_scope: SessionScope::Channel,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
             heartbeat_prompt: None,
@@ -2808,6 +2848,43 @@ channels = "ALL"
     // A minimal valid private key for test use (secp256k1 scalar = 1).
     const TEST_PRIVATE_KEY: &str =
         "0000000000000000000000000000000000000000000000000000000000000001";
+
+    #[test]
+    fn agent_session_scope_requires_one_worker() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--session-scope",
+            "agent",
+            "--agents",
+            "2",
+        ])
+        .expect("clap should parse session scope");
+
+        let error = match Config::from_args(args) {
+            Ok(_) => panic!("agent scope must reject a pool"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("requires BUZZ_ACP_AGENTS=1"));
+    }
+
+    #[test]
+    fn agent_session_scope_is_preserved_in_config() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--session-scope",
+            "agent",
+        ])
+        .expect("clap should parse session scope");
+
+        assert_eq!(
+            Config::from_args(args).unwrap().session_scope,
+            SessionScope::Agent
+        );
+    }
 
     #[test]
     fn allowed_respond_to_full_path_rejects_disallowed_mode() {

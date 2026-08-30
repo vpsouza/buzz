@@ -18,9 +18,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+use crate::config::{DedupMode, SessionScope};
 use crate::prompt_project::PromptProjectInfo;
 
-use crate::config::DedupMode;
+/// Stable logical lane for an agent-scoped ACP session. It is internal only:
+/// every `QueuedEvent` keeps its original Buzz channel for prompt routing.
+const AGENT_SESSION_KEY: Uuid = Uuid::nil();
 
 /// Maximum events queued per channel before oldest events are dropped.
 const MAX_PENDING_PER_CHANNEL: usize = 500;
@@ -77,6 +80,7 @@ pub enum CancelReason {
 /// A batch of events to prompt the agent with.
 #[derive(Debug, Clone)]
 pub struct FlushBatch {
+    /// Original Buzz channel for the prompt envelope and reply metadata.
     pub channel_id: Uuid,
     pub events: Vec<BatchEvent>,
     /// Events from a cancelled batch that triggered this re-prompt.
@@ -137,6 +141,7 @@ pub struct FlushBatch {
 ///     else: push_front with original received_at, set exponential backoff retry_after with jitter
 /// ```
 pub struct EventQueue {
+    session_scope: SessionScope,
     queues: HashMap<Uuid, VecDeque<QueuedEvent>>,
     in_flight_channels: HashSet<Uuid>,
     /// Per-channel deadline for auto-expiring stuck in-flight entries.
@@ -150,11 +155,11 @@ pub struct EventQueue {
     /// Events from cancelled batches, keyed by channel. Merged into the next
     /// `FlushBatch` for that channel as `cancelled_events` so `format_prompt()`
     /// can produce annotated "[Previous request — interrupted]" sections.
-    cancelled_batches: HashMap<Uuid, Vec<BatchEvent>>,
+    cancelled_batches: HashMap<(Uuid, Uuid), Vec<BatchEvent>>,
     /// Why each channel's cancelled batch was cancelled (steer vs interrupt).
     /// Set by `requeue_as_cancelled`, consumed by `flush_next` to set
     /// `FlushBatch::cancel_reason`. Keyed by channel, cleared on flush.
-    cancel_reasons: HashMap<Uuid, CancelReason>,
+    cancel_reasons: HashMap<(Uuid, Uuid), CancelReason>,
     /// Events withheld from `queues` while a goose-native steer is in flight
     /// for that event. Invisible to `flush_next` / `has_flushable_work` /
     /// `drain` (the events have been moved out of `queues`), so the queue's
@@ -179,7 +184,12 @@ impl EventQueue {
     /// Call [`with_in_flight_deadline`](Self::with_in_flight_deadline) to
     /// derive the deadline from the configured `max_turn_duration`.
     pub fn new(dedup_mode: DedupMode) -> Self {
+        Self::with_session_scope(dedup_mode, SessionScope::Channel)
+    }
+
+    pub fn with_session_scope(dedup_mode: DedupMode, session_scope: SessionScope) -> Self {
         Self {
+            session_scope,
             queues: HashMap::new(),
             in_flight_channels: HashSet::new(),
             in_flight_deadlines: HashMap::new(),
@@ -192,6 +202,18 @@ impl EventQueue {
             withheld_native_steer: HashMap::new(),
             in_flight_deadline: Duration::from_secs(DEFAULT_IN_FLIGHT_DEADLINE_SECS),
         }
+    }
+
+    /// Resolve a source channel to its ACP session and queue lane.
+    pub fn session_key(&self, channel_id: Uuid) -> Uuid {
+        match self.session_scope {
+            SessionScope::Channel => channel_id,
+            SessionScope::Agent => AGENT_SESSION_KEY,
+        }
+    }
+
+    fn cancelled_key(&self, channel_id: Uuid) -> (Uuid, Uuid) {
+        (self.session_key(channel_id), channel_id)
     }
 
     /// Set the in-flight backstop deadline from the configured max turn
@@ -210,6 +232,7 @@ impl EventQueue {
     /// via `mark_complete`), this is a no-op: a late ack never resurrects
     /// a deadline.
     pub fn extend_in_flight_deadline(&mut self, channel_id: Uuid, max_turn_secs: u64) {
+        let channel_id = self.session_key(channel_id);
         if let Some(current) = self.in_flight_deadlines.get_mut(&channel_id) {
             let extended = Instant::now()
                 + Duration::from_secs(max_turn_secs + IN_FLIGHT_DEADLINE_BUFFER_SECS);
@@ -230,8 +253,9 @@ impl EventQueue {
     ///
     /// Returns `true` if the event was accepted, `false` if dropped.
     pub fn push(&mut self, event: QueuedEvent) -> bool {
+        let session_id = self.session_key(event.channel_id);
         if matches!(self.dedup_mode, DedupMode::Drop)
-            && self.in_flight_channels.contains(&event.channel_id)
+            && self.in_flight_channels.contains(&session_id)
         {
             tracing::debug!(
                 channel_id = %event.channel_id,
@@ -239,7 +263,7 @@ impl EventQueue {
             );
             return false;
         }
-        let queue = self.queues.entry(event.channel_id).or_default();
+        let queue = self.queues.entry(session_id).or_default();
         // Enforce per-channel depth cap: drop oldest to make room.
         if queue.len() >= MAX_PENDING_PER_CHANNEL {
             queue.pop_front();
@@ -290,7 +314,7 @@ impl EventQueue {
 
         // Find the channel whose head event has the oldest received_at,
         // excluding in-flight channels and throttled channels.
-        let channel_id = self
+        let session_id = self
             .queues
             .iter()
             .filter(|(id, q)| {
@@ -304,26 +328,28 @@ impl EventQueue {
         // Fallback: if no queued events are ready but a channel has cancelled
         // events waiting (e.g., explicit !cancel with no new @mention), flush
         // those as a regular batch (re-dispatch unchanged).
-        let channel_id = match channel_id {
+        let session_id = match session_id {
             Some(id) => id,
             None => {
                 let cancelled_id = self
                     .cancelled_batches
                     .keys()
-                    .find(|id| !self.in_flight_channels.contains(id))
+                    .find(|(session_id, _)| !self.in_flight_channels.contains(session_id))
                     .copied();
                 match cancelled_id {
-                    Some(id) => {
+                    Some((session_id, channel_id)) => {
                         // Move cancelled events into the regular events slot.
                         // No new events to merge — re-dispatch the original batch.
-                        let cancelled = self.cancelled_batches.remove(&id).unwrap_or_default();
-                        let cancel_reason = self.cancel_reasons.remove(&id);
-                        self.in_flight_channels.insert(id);
+                        let key = (session_id, channel_id);
+                        let cancelled = self.cancelled_batches.remove(&key).unwrap_or_default();
+                        let cancel_reason = self.cancel_reasons.remove(&key);
+                        self.in_flight_channels.insert(session_id);
                         self.in_flight_deadlines
-                            .insert(id, now + self.in_flight_deadline);
-                        self.in_flight_batch_sizes.insert(id, cancelled.len());
+                            .insert(session_id, now + self.in_flight_deadline);
+                        self.in_flight_batch_sizes
+                            .insert(session_id, cancelled.len());
                         return Some(FlushBatch {
-                            channel_id: id,
+                            channel_id,
                             events: cancelled,
                             cancelled_events: vec![],
                             cancel_reason,
@@ -335,8 +361,17 @@ impl EventQueue {
         };
 
         // Drain up to MAX_BATCH_EVENTS; leave any remainder in the queue.
-        let queue = self.queues.entry(channel_id).or_default();
-        let drain_count = MAX_BATCH_EVENTS.min(queue.len());
+        let queue = self.queues.entry(session_id).or_default();
+        // Agent scope has one global FIFO. Only drain the contiguous run from
+        // one origin so every rendered prompt retains a single, unambiguous
+        // channel/thread reply envelope while still preserving cross-channel
+        // arrival order (A, B, A becomes three ordered turns).
+        let channel_id = queue.front()?.channel_id;
+        let drain_count = queue
+            .iter()
+            .take_while(|event| event.channel_id == channel_id)
+            .take(MAX_BATCH_EVENTS)
+            .count();
         let mut events: Vec<BatchEvent> = queue
             .drain(..drain_count)
             .map(|qe| BatchEvent {
@@ -352,25 +387,25 @@ impl EventQueue {
         events.sort_by_key(|be| be.event.created_at);
 
         // Remove the queue entry if now empty.
-        if self.queues.get(&channel_id).is_some_and(|q| q.is_empty()) {
-            self.queues.remove(&channel_id);
+        if self.queues.get(&session_id).is_some_and(|q| q.is_empty()) {
+            self.queues.remove(&session_id);
         }
 
-        self.in_flight_channels.insert(channel_id);
+        self.in_flight_channels.insert(session_id);
         self.in_flight_deadlines
-            .insert(channel_id, now + self.in_flight_deadline);
-        self.in_flight_batch_sizes.insert(channel_id, events.len());
+            .insert(session_id, now + self.in_flight_deadline);
+        self.in_flight_batch_sizes.insert(session_id, events.len());
 
         // Merge any cancelled events stored by requeue_as_cancelled().
         let cancelled_events = self
             .cancelled_batches
-            .remove(&channel_id)
+            .remove(&(session_id, channel_id))
             .unwrap_or_default();
         let cancel_reason = if cancelled_events.is_empty() {
-            self.cancel_reasons.remove(&channel_id);
+            self.cancel_reasons.remove(&(session_id, channel_id));
             None
         } else {
-            self.cancel_reasons.remove(&channel_id)
+            self.cancel_reasons.remove(&(session_id, channel_id))
         };
 
         Some(FlushBatch {
@@ -392,21 +427,22 @@ impl EventQueue {
     ///
     /// Also cleans up any already-expired `retry_after` entry.
     pub fn mark_complete(&mut self, channel_id: Uuid) {
-        self.in_flight_channels.remove(&channel_id);
-        self.in_flight_deadlines.remove(&channel_id);
-        self.in_flight_batch_sizes.remove(&channel_id);
+        let session_id = self.session_key(channel_id);
+        self.in_flight_channels.remove(&session_id);
+        self.in_flight_deadlines.remove(&session_id);
+        self.in_flight_batch_sizes.remove(&session_id);
         let now = Instant::now();
-        match self.retry_after.get(&channel_id) {
+        match self.retry_after.get(&session_id) {
             // Active throttle → channel was requeued; keep retry_counts intact.
             Some(&deadline) if deadline > now => {}
             // Expired or absent throttle → successful completion; reset counter
             // and clean up the stale retry_after entry.
             Some(_) => {
-                self.retry_after.remove(&channel_id);
-                self.retry_counts.remove(&channel_id);
+                self.retry_after.remove(&session_id);
+                self.retry_counts.remove(&session_id);
             }
             None => {
-                self.retry_counts.remove(&channel_id);
+                self.retry_counts.remove(&session_id);
             }
         }
     }
@@ -430,8 +466,9 @@ impl EventQueue {
     /// `mark_complete` separately.
     pub fn requeue(&mut self, batch: FlushBatch) -> Option<FlushBatch> {
         let channel_id = batch.channel_id;
+        let session_id = self.session_key(channel_id);
         let attempt = {
-            let count = self.retry_counts.entry(channel_id).or_insert(0);
+            let count = self.retry_counts.entry(session_id).or_insert(0);
             *count += 1;
             *count
         };
@@ -445,10 +482,10 @@ impl EventQueue {
                 MAX_RETRIES,
                 batch.events.len(),
             );
-            self.retry_counts.remove(&channel_id);
+            self.retry_counts.remove(&session_id);
             // Also clear retry_after so fresh traffic on this channel isn't
             // throttled by stale backoff from the discarded poison batch.
-            self.retry_after.remove(&channel_id);
+            self.retry_after.remove(&session_id);
             return Some(batch);
         }
 
@@ -474,7 +511,7 @@ impl EventQueue {
             "requeueing failed batch with backoff"
         );
 
-        let queue = self.queues.entry(channel_id).or_default();
+        let queue = self.queues.entry(session_id).or_default();
         // Push to front in reverse order so original order is preserved.
         for be in batch.events.into_iter().rev() {
             queue.push_front(QueuedEvent {
@@ -495,7 +532,7 @@ impl EventQueue {
                 "requeue overflow — dropped oldest event to enforce cap"
             );
         }
-        self.retry_after.insert(channel_id, Instant::now() + delay);
+        self.retry_after.insert(session_id, Instant::now() + delay);
         None
     }
 
@@ -509,7 +546,7 @@ impl EventQueue {
     /// caller must call `mark_complete` separately.
     pub fn requeue_preserve_timestamps(&mut self, batch: FlushBatch) {
         let channel_id = batch.channel_id;
-        let queue = self.queues.entry(channel_id).or_default();
+        let queue = self.queues.entry(self.session_key(channel_id)).or_default();
         // Push to front in reverse order so original order is preserved.
         for be in batch.events.into_iter().rev() {
             queue.push_front(QueuedEvent {
@@ -542,11 +579,12 @@ impl EventQueue {
     /// the generic queue — they are stored separately and merged by
     /// `flush_next()`. No retry throttle, no backoff.
     pub fn requeue_as_cancelled(&mut self, batch: FlushBatch, reason: CancelReason) {
-        let entry = self.cancelled_batches.entry(batch.channel_id).or_default();
+        let key = self.cancelled_key(batch.channel_id);
+        let entry = self.cancelled_batches.entry(key).or_default();
         // Preserve any already-cancelled events from a prior cancel (double-cancel).
         entry.extend(batch.cancelled_events);
         entry.extend(batch.events);
-        self.cancel_reasons.insert(batch.channel_id, reason);
+        self.cancel_reasons.insert(key, reason);
     }
 
     /// Returns `true` if any channel has pending events that are not in-flight
@@ -589,7 +627,7 @@ impl EventQueue {
         }) || self
             .cancelled_batches
             .keys()
-            .any(|id| !self.in_flight_channels.contains(id))
+            .any(|(session_id, _)| !self.in_flight_channels.contains(session_id))
     }
 
     /// Returns `true` if any undispatched work remains for a channel that is
@@ -617,7 +655,7 @@ impl EventQueue {
         let has_cancelled = self
             .cancelled_batches
             .keys()
-            .any(|id| !self.in_flight_channels.contains(id));
+            .any(|(session_id, _)| !self.in_flight_channels.contains(session_id));
         let has_withheld = self
             .withheld_native_steer
             .iter()
@@ -633,7 +671,13 @@ impl EventQueue {
     /// Number of queued events for a specific channel. Test-only.
     #[cfg(test)]
     pub fn queued_event_count(&self, channel_id: &Uuid) -> usize {
-        self.queues.get(channel_id).map_or(0, |q| q.len())
+        self.queues
+            .get(&self.session_key(*channel_id))
+            .map_or(0, |q| {
+                q.iter()
+                    .filter(|event| event.channel_id == *channel_id)
+                    .count()
+            })
     }
 
     /// Force a channel's retry-attempt counter to `count`, simulating `count`
@@ -643,7 +687,8 @@ impl EventQueue {
     /// `requeue()`'s dead-letter threshold directly.
     #[cfg(test)]
     pub fn set_retry_count_for_test(&mut self, channel_id: Uuid, count: u32) {
-        self.retry_counts.insert(channel_id, count);
+        let session_id = self.session_key(channel_id);
+        self.retry_counts.insert(session_id, count);
     }
 
     /// Drop all queued (non-in-flight) events for a channel.
@@ -658,16 +703,38 @@ impl EventQueue {
     /// Returns the event IDs of dropped events so the caller can clean up
     /// any reactions (👀) that were added at queue-push time.
     pub fn drain_channel(&mut self, channel_id: Uuid) -> Vec<String> {
-        let ids = self
-            .queues
-            .remove(&channel_id)
-            .map(|q| q.into_iter().map(|e| e.event.id.to_hex()).collect())
-            .unwrap_or_default();
-        self.retry_after.remove(&channel_id);
-        self.retry_counts.remove(&channel_id);
-        self.cancelled_batches.remove(&channel_id);
-        self.cancel_reasons.remove(&channel_id);
-        self.withheld_native_steer.remove(&channel_id);
+        let session_id = self.session_key(channel_id);
+        let mut ids = Vec::new();
+        if let Some(queue) = self.queues.get_mut(&session_id) {
+            let mut kept = VecDeque::with_capacity(queue.len());
+            while let Some(event) = queue.pop_front() {
+                if event.channel_id == channel_id {
+                    ids.push(event.event.id.to_hex());
+                } else {
+                    kept.push_back(event);
+                }
+            }
+            *queue = kept;
+            if queue.is_empty() {
+                self.queues.remove(&session_id);
+            }
+        }
+        // Retry state belongs to the one shared agent lane; only clear it
+        // when channel scope is in use, otherwise unrelated queued origins
+        // must retain their backoff/ordering state.
+        if self.session_scope == SessionScope::Channel {
+            self.retry_after.remove(&session_id);
+            self.retry_counts.remove(&session_id);
+        }
+        let key = (session_id, channel_id);
+        self.cancelled_batches.remove(&key);
+        self.cancel_reasons.remove(&key);
+        if let Some(entries) = self.withheld_native_steer.get_mut(&session_id) {
+            entries.retain(|event| event.channel_id != channel_id);
+            if entries.is_empty() {
+                self.withheld_native_steer.remove(&session_id);
+            }
+        }
         // Preserve in_flight_channels AND in_flight_deadlines: the in-flight
         // task will eventually complete (calling mark_complete) or the deadline
         // will expire (auto-cleaning the channel). Removing deadlines without
@@ -678,7 +745,8 @@ impl EventQueue {
 
     /// Whether a prompt is currently in-flight for the given channel.
     pub fn is_channel_in_flight(&self, channel_id: Uuid) -> bool {
-        self.in_flight_channels.contains(&channel_id)
+        self.in_flight_channels
+            .contains(&self.session_key(channel_id))
     }
 
     /// Whether any channel currently has a turn in flight.
@@ -711,7 +779,8 @@ impl EventQueue {
     /// is spawned, so the withhold is established before `mark_complete` /
     /// any subsequent `flush_next` tick can run.
     pub fn mark_native_steer_pending(&mut self, channel_id: Uuid, event_id: &str) -> bool {
-        let Some(q) = self.queues.get_mut(&channel_id) else {
+        let session_id = self.session_key(channel_id);
+        let Some(q) = self.queues.get_mut(&session_id) else {
             return false;
         };
         let Some(pos) = q.iter().position(|qe| qe.event.id.to_hex() == event_id) else {
@@ -721,10 +790,10 @@ impl EventQueue {
             .remove(pos)
             .expect("position came from iter so remove must succeed");
         if q.is_empty() {
-            self.queues.remove(&channel_id);
+            self.queues.remove(&session_id);
         }
         self.withheld_native_steer
-            .entry(channel_id)
+            .entry(session_id)
             .or_default()
             .push(qe);
         true
@@ -741,7 +810,8 @@ impl EventQueue {
     /// Push-to-front matches the discipline of `requeue_preserve_timestamps`
     /// at line 453, preserving fairness across channels.
     pub fn release_native_steer(&mut self, channel_id: Uuid, event_id: &str) {
-        let Some(entries) = self.withheld_native_steer.get_mut(&channel_id) else {
+        let session_id = self.session_key(channel_id);
+        let Some(entries) = self.withheld_native_steer.get_mut(&session_id) else {
             return;
         };
         let Some(pos) = entries
@@ -752,12 +822,12 @@ impl EventQueue {
         };
         let qe = entries.remove(pos);
         if entries.is_empty() {
-            self.withheld_native_steer.remove(&channel_id);
+            self.withheld_native_steer.remove(&session_id);
         }
         // Push to FRONT so original `received_at` keeps the event at the head
         // of the channel's queue. Per-channel cap is enforced below in case
         // a flood of events arrived during the ack window.
-        let queue = self.queues.entry(channel_id).or_default();
+        let queue = self.queues.entry(session_id).or_default();
         queue.push_front(qe);
         while queue.len() > MAX_PENDING_PER_CHANNEL {
             queue.pop_back();
@@ -776,16 +846,17 @@ impl EventQueue {
     /// event has been "delivered" via the non-cancelling path and must not
     /// be redelivered via normal dispatch. Idempotent across both stores.
     pub fn remove_event(&mut self, channel_id: Uuid, event_id: &str) {
-        if let Some(entries) = self.withheld_native_steer.get_mut(&channel_id) {
+        let session_id = self.session_key(channel_id);
+        if let Some(entries) = self.withheld_native_steer.get_mut(&session_id) {
             entries.retain(|qe| qe.event.id.to_hex() != event_id);
             if entries.is_empty() {
-                self.withheld_native_steer.remove(&channel_id);
+                self.withheld_native_steer.remove(&session_id);
             }
         }
-        if let Some(q) = self.queues.get_mut(&channel_id) {
+        if let Some(q) = self.queues.get_mut(&session_id) {
             q.retain(|qe| qe.event.id.to_hex() != event_id);
             if q.is_empty() {
-                self.queues.remove(&channel_id);
+                self.queues.remove(&session_id);
             }
         }
     }
@@ -6052,5 +6123,51 @@ mod tests {
             !prompt.contains("Description:"),
             "unresolved metadata must not render a Description field; got: {prompt}"
         );
+    }
+
+    #[test]
+    fn agent_scope_serializes_origins_in_one_fifo_and_preserves_origin() {
+        let mut queue = EventQueue::with_session_scope(DedupMode::Queue, SessionScope::Agent);
+        let channel_a = Uuid::new_v4();
+        let channel_b = Uuid::new_v4();
+
+        queue.push(make_queued(channel_a, "from-a"));
+        queue.push(make_queued(channel_b, "from-b"));
+        queue.push(make_queued(channel_a, "from-a-again"));
+
+        let first = queue.flush_next().expect("first FIFO item");
+        assert_eq!(first.channel_id, channel_a);
+        assert_eq!(first.events.len(), 1, "must not merge another origin");
+        assert!(queue.is_channel_in_flight(channel_b));
+        queue.mark_complete(channel_a);
+
+        let second = queue.flush_next().expect("second FIFO item");
+        assert_eq!(second.channel_id, channel_b);
+        assert_eq!(second.events.len(), 1);
+        queue.mark_complete(channel_b);
+
+        let third = queue.flush_next().expect("third FIFO item");
+        assert_eq!(third.channel_id, channel_a);
+        assert_eq!(third.events.len(), 1);
+    }
+
+    #[test]
+    fn two_agent_scoped_primaries_are_isolated_process_local_fifos() {
+        // A logical agent session key is intentionally shared only *inside one
+        // buzz-acp process*. Atlas and Nova each own their own process/home, so
+        // identical channel IDs must never make their FIFO state cross over.
+        let channel = Uuid::new_v4();
+        let mut atlas = EventQueue::with_session_scope(DedupMode::Queue, SessionScope::Agent);
+        let mut nova = EventQueue::with_session_scope(DedupMode::Queue, SessionScope::Agent);
+
+        assert!(atlas.push(make_queued(channel, "Atlas local task")));
+        assert!(nova.push(make_queued(channel, "Nova local task")));
+
+        let atlas_batch = atlas.flush_next().expect("Atlas receives its prompt");
+        let nova_batch = nova.flush_next().expect("Nova receives its prompt");
+        assert_eq!(atlas_batch.events[0].event.content, "Atlas local task");
+        assert_eq!(nova_batch.events[0].event.content, "Nova local task");
+        assert_eq!(atlas.session_key(channel), Uuid::nil());
+        assert_eq!(nova.session_key(channel), Uuid::nil());
     }
 }

@@ -17,11 +17,13 @@ mod usage;
 pub use usage::TurnUsage;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use acp::{AcpClient, EnvVar, McpServer};
-use anyhow::{ensure, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use buzz_core::kind::{
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
     KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
@@ -1899,6 +1901,339 @@ pub fn run() -> Result<()> {
     tokio_main()
 }
 
+const BUZZ_DESKTOP_PID_ENV: &str = "BUZZ_DESKTOP_PID";
+const BUZZ_FIRSTMATE_HOME_ENV: &str = "BUZZ_FIRSTMATE_HOME";
+const BUZZ_FIRSTMATE_PERSISTED_ENV: &str = "BUZZ_FIRSTMATE_PERSISTED";
+const BUZZ_FIRSTMATE_HARNESS_PID_ENV: &str = "BUZZ_FIRSTMATE_HARNESS_PID";
+const BUZZ_FIRSTMATE_SUPERVISOR_GENERATION_ENV: &str = "BUZZ_FIRSTMATE_SUPERVISOR_GENERATION";
+
+/// Broker-owned FirstMate supervision is a separate child of buzz-acp, not an
+/// agent tool call. Keeping it here means the Desktop process owns its exact
+/// parent and the desktop watchdog naturally reaps it on abrupt exit.
+struct FirstMateSupervisor {
+    home: PathBuf,
+    generation: u64,
+    child: tokio::process::Child,
+    log: std::fs::File,
+}
+
+fn firstmate_supervisor_env(home: &Path, generation: u64) -> Vec<(&'static str, String)> {
+    let home = home.display().to_string();
+    vec![
+        ("FM_HOME", home.clone()),
+        (BUZZ_FIRSTMATE_HOME_ENV, home),
+        (BUZZ_FIRSTMATE_PERSISTED_ENV, "1".to_string()),
+        (
+            BUZZ_FIRSTMATE_HARNESS_PID_ENV,
+            std::process::id().to_string(),
+        ),
+        (
+            BUZZ_FIRSTMATE_SUPERVISOR_GENERATION_ENV,
+            generation.to_string(),
+        ),
+    ]
+}
+
+fn supervisor_field<'a>(contents: &'a str, key: &str) -> Option<&'a str> {
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{key}=")))
+}
+
+/// Allocate the next monotonic generation under this *canonical FirstMate
+/// home*. The state is intentionally beside the FirstMate lease rather than
+/// in a sidecar PID or wall clock: after Desktop/ACP restart it always exceeds
+/// the generation a killed supervisor left behind.
+fn allocate_firstmate_supervisor_generation(home: &Path) -> Result<u64> {
+    let root = home.join("state/.buzz-supervisor");
+    if root.exists() && std::fs::symlink_metadata(&root)?.file_type().is_symlink() {
+        bail!(
+            "FirstMate supervisor state must not be a symlink: {}",
+            root.display()
+        );
+    }
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("create FirstMate supervisor state at {}", root.display()))?;
+    let lock = root.join(".broker-generation.lock");
+    let mut acquired = false;
+    for _ in 0..50 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+        {
+            Ok(_) => {
+                acquired = true;
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error).context("lock FirstMate supervisor generation"),
+        }
+    }
+    if !acquired {
+        bail!(
+            "FirstMate supervisor generation lock is busy: {}",
+            lock.display()
+        );
+    }
+    let result = (|| -> Result<u64> {
+        let lease = root.join("lease");
+        if lease.exists() {
+            let metadata = std::fs::symlink_metadata(&lease)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                bail!("FirstMate supervisor lease is not a regular file");
+            }
+            let lease_text = std::fs::read_to_string(&lease)?;
+            let owner = supervisor_field(&lease_text, "pid")
+                .ok_or_else(|| anyhow!("FirstMate supervisor lease has no owner pid"))?
+                .parse::<u32>()
+                .map_err(|_| anyhow!("FirstMate supervisor lease has invalid owner pid"))?;
+            if owner != std::process::id() && process_is_alive(owner) {
+                bail!("FirstMate supervisor is already owned by live ACP pid {owner}");
+            }
+        }
+        let counter = root.join("broker-generation");
+        let previous = if counter.exists() {
+            std::fs::read_to_string(&counter)?
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| anyhow!("FirstMate supervisor generation is invalid"))?
+        } else {
+            0
+        };
+        let next = previous
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("FirstMate supervisor generation overflow"))?;
+        let tmp = root.join(format!(
+            ".broker-generation-{}.tmp",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::write(&tmp, format!("{next}\n"))?;
+        std::fs::rename(&tmp, &counter)?;
+        Ok(next)
+    })();
+    let _ = std::fs::remove_file(&lock);
+    result
+}
+
+async fn start_firstmate_supervisor() -> Result<Option<FirstMateSupervisor>> {
+    let Some(raw_home) = std::env::var_os(BUZZ_FIRSTMATE_HOME_ENV) else {
+        return Ok(None);
+    };
+    if std::env::var(BUZZ_FIRSTMATE_PERSISTED_ENV).as_deref() != Ok("1") {
+        bail!("{BUZZ_FIRSTMATE_HOME_ENV} is present without broker-attested {BUZZ_FIRSTMATE_PERSISTED_ENV}=1");
+    }
+    let home = std::fs::canonicalize(Path::new(&raw_home))
+        .context("canonicalize broker-attested FirstMate home")?;
+    let cwd = std::fs::canonicalize(std::env::current_dir()?)?;
+    if !home.is_dir() || cwd != home {
+        bail!("broker-attested FirstMate home must equal ACP canonical cwd");
+    }
+    let lifecycle = home.join("bin/fm-buzz-lifecycle.sh");
+    let metadata = std::fs::symlink_metadata(&lifecycle)
+        .with_context(|| format!("read FirstMate lifecycle at {}", lifecycle.display()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!(
+            "FirstMate lifecycle is not a regular file: {}",
+            lifecycle.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            bail!(
+                "FirstMate lifecycle is not executable: {}",
+                lifecycle.display()
+            );
+        }
+    }
+    let generation = allocate_firstmate_supervisor_generation(&home)?;
+    let env = firstmate_supervisor_env(&home, generation);
+    let output = std::process::Command::new(&lifecycle)
+        .arg("start")
+        .current_dir(&home)
+        .envs(env.iter().map(|(k, v)| (*k, v)))
+        .output()
+        .context("start FirstMate supervisor")?;
+    if !output.status.success() {
+        bail!(
+            "FirstMate supervisor start failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let log_dir = home.join("state/.buzz-supervisor");
+    let log_path = log_dir.join("acp-supervisor.log");
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("open FirstMate supervisor log at {}", log_path.display()))?;
+    writeln!(
+        log,
+        "generation={generation} acp_pid={} start={}",
+        std::process::id(),
+        String::from_utf8_lossy(&output.stdout).trim()
+    )?;
+    let stderr = log.try_clone()?;
+    let mut command = tokio::process::Command::new(&lifecycle);
+    command
+        .arg("serve")
+        .current_dir(&home)
+        .envs(env)
+        .stdout(std::process::Stdio::from(log.try_clone()?))
+        .stderr(std::process::Stdio::from(stderr))
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = command
+        .spawn()
+        .context("spawn tracked FirstMate supervisor")?;
+    Ok(Some(FirstMateSupervisor {
+        home,
+        generation,
+        child,
+        log,
+    }))
+}
+
+fn attach_firstmate_supervisor_lifecycle(
+    mut supervisor: FirstMateSupervisor,
+    mut shutdown_rx: watch::Receiver<()>,
+    shutdown_tx: watch::Sender<()>,
+) {
+    tokio::spawn(async move {
+        tokio::select! {
+            status = supervisor.child.wait() => {
+                let _ = writeln!(supervisor.log, "generation={} supervisor-exit={:?}", supervisor.generation, status);
+                tracing::error!(home = %supervisor.home.display(), generation = supervisor.generation, "FirstMate supervisor exited; shutting down ACP fail-closed");
+                let _ = shutdown_tx.send(());
+            }
+            _ = shutdown_rx.changed() => {
+                let _ = writeln!(supervisor.log, "generation={} acp-shutdown=reap", supervisor.generation);
+                match supervisor.child.id() {
+                    Some(pid) if acp::kill_process_group(pid) => {}
+                    _ => { let _ = supervisor.child.start_kill(); }
+                }
+                let _ = tokio::time::timeout(Duration::from_secs(5), supervisor.child.wait()).await;
+                let _ = writeln!(supervisor.log, "generation={} acp-shutdown=reaped", supervisor.generation);
+            }
+        }
+    });
+}
+
+fn desktop_parent_pid_from_env() -> Result<Option<u32>> {
+    desktop_parent_pid(std::env::var_os(BUZZ_DESKTOP_PID_ENV).as_deref())
+}
+
+fn desktop_parent_pid(raw: Option<&std::ffi::OsStr>) -> Result<Option<u32>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let raw = raw
+        .to_str()
+        .ok_or_else(|| anyhow!("{BUZZ_DESKTOP_PID_ENV} must be valid UTF-8"))?;
+    let pid = raw
+        .parse::<u32>()
+        .map_err(|_| anyhow!("{BUZZ_DESKTOP_PID_ENV} must be a positive process id"))?;
+    if pid <= 1 {
+        bail!("{BUZZ_DESKTOP_PID_ENV} must be greater than 1");
+    }
+    Ok(Some(pid))
+}
+
+#[cfg(test)]
+#[test]
+fn desktop_parent_pid_is_optional_and_strict() {
+    use std::ffi::OsStr;
+
+    assert_eq!(desktop_parent_pid(None).unwrap(), None);
+    assert_eq!(
+        desktop_parent_pid(Some(OsStr::new("4242"))).unwrap(),
+        Some(4242)
+    );
+    for invalid in ["", "0", "1", "-1", "abc", " 42"] {
+        assert!(desktop_parent_pid(Some(OsStr::new(invalid))).is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn current_process_is_alive_for_desktop_watchdog() {
+    assert!(process_is_alive(std::process::id()));
+}
+
+#[cfg(all(test, unix))]
+#[tokio::test]
+async fn firstmate_supervisor_is_reaped_when_its_acp_owner_shuts_down() {
+    let root = std::env::temp_dir().join(format!(
+        "buzz-acp-firstmate-supervisor-owner-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join("supervisor.log"))
+        .unwrap();
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .args(["-c", "sleep 60"])
+        .process_group(0)
+        .kill_on_drop(true);
+    let child = command.spawn().unwrap();
+    let pid = child.id().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    attach_firstmate_supervisor_lifecycle(
+        FirstMateSupervisor {
+            home: root.clone(),
+            generation: 1,
+            child,
+            log,
+        },
+        shutdown_rx,
+        shutdown_tx.clone(),
+    );
+    shutdown_tx.send(()).unwrap();
+    for _ in 0..100 {
+        if !process_is_alive(pid) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !process_is_alive(pid),
+        "owner shutdown must reap the tracked FirstMate supervisor child"
+    );
+    let log = std::fs::read_to_string(root.join("supervisor.log")).unwrap();
+    assert!(log.contains("acp-shutdown=reaped"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    match kill(Pid::from_raw(pid as i32), None) {
+        Ok(()) | Err(Errno::EPERM) => true,
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    // Windows process ownership is enforced by Desktop's Job Object. Refuse to
+    // reuse a persisted Unix-style supervisor lease there rather than claiming
+    // a liveness proof this binary cannot make.
+    true
+}
+
 #[tokio::main]
 async fn tokio_main() -> Result<()> {
     // Install the ring crypto provider for rustls (required for wss:// connections).
@@ -1957,6 +2292,11 @@ async fn tokio_main() -> Result<()> {
         tracing::info!("buzz-acp: setup payload present, entering setup-listener mode");
         return setup_mode::run_setup_listener(config, payload).await;
     }
+
+    // A persisted FirstMate is supervised before its agent pool can accept
+    // work. A missing/forged home, failed bootstrap, or live duplicate owner
+    // aborts startup rather than leaving crew work without a watcher.
+    let firstmate_supervisor = start_firstmate_supervisor().await?;
 
     tracing::info!("buzz-acp starting: {}", config.summary());
 
@@ -2166,8 +2506,8 @@ async fn tokio_main() -> Result<()> {
 
     let runtime_start_nonce = std::env::var("BUZZ_MANAGED_AGENT_START_NONCE").unwrap_or_default();
     let dedup_mode = config.dedup_mode;
-    let mut queue =
-        EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
+    let mut queue = EventQueue::with_session_scope(dedup_mode, config.session_scope)
+        .with_in_flight_deadline(config.max_turn_duration_secs);
 
     // Online means the harness can receive work, not merely that its socket is
     // connected. Publishing after channel subscriptions gives desktop callers
@@ -2192,6 +2532,7 @@ async fn tokio_main() -> Result<()> {
 
     let base_prompt_content = config.base_prompt_content.take();
     let cwd = current_working_directory()?;
+    let outbound_messages = pool::OutboundMessageTracker::default();
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config),
         initial_message: config.initial_message.clone(),
@@ -2223,6 +2564,8 @@ async fn tokio_main() -> Result<()> {
         memory_enabled: config.memory_enabled,
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),
+        session_scope: config.session_scope,
+        outbound_messages,
     });
 
     if !config.memory_enabled {
@@ -2330,6 +2673,10 @@ async fn tokio_main() -> Result<()> {
     // ── Step 7: Shutdown signal ───────────────────────────────────────────────
     let (shutdown_tx, mut shutdown_rx) = watch::channel(());
 
+    if let Some(supervisor) = firstmate_supervisor {
+        attach_firstmate_supervisor_lifecycle(supervisor, shutdown_rx.clone(), shutdown_tx.clone());
+    }
+
     let tx = shutdown_tx.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
@@ -2345,6 +2692,24 @@ async fn tokio_main() -> Result<()> {
             sigterm.recv().await;
             let _ = tx.send(());
         });
+
+        if let Some(desktop_pid) = desktop_parent_pid_from_env()? {
+            let tx = shutdown_tx.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    interval.tick().await;
+                    if !process_is_alive(desktop_pid) {
+                        eprintln!(
+                            "buzz-acp: desktop process {desktop_pid} exited; shutting down sidecar"
+                        );
+                        let _ = tx.send(());
+                        break;
+                    }
+                }
+            });
+        }
     }
 
     // Track the newest membership notification timestamp per channel.
@@ -2712,7 +3077,9 @@ async fn tokio_main() -> Result<()> {
                                     // complete normally (the relay may reject actions if
                                     // the agent lost access).
                                     let drained_ids = queue.drain_channel(ch);
-                                    let invalidated = if pool_ready {
+                                    let invalidated = if pool_ready
+                                        && config.session_scope == config::SessionScope::Channel
+                                    {
                                         pool.invalidate_channel_sessions(ch)
                                     } else {
                                         0
@@ -2748,7 +3115,11 @@ async fn tokio_main() -> Result<()> {
                                 continue;
                             }
 
-                            if config.ignore_self && buzz_event.event.pubkey.to_hex() == pubkey_hex {
+                            let self_authored = buzz_event.event.pubkey.to_hex() == pubkey_hex;
+                            if self_authored && kind_u32 == 9 {
+                                ctx.outbound_messages.observe(buzz_event.channel_id);
+                            }
+                            if config.ignore_self && self_authored {
                                 tracing::debug!(channel_id = %buzz_event.channel_id, "dropping self-authored event");
                                 continue;
                             }
@@ -2796,7 +3167,7 @@ async fn tokio_main() -> Result<()> {
                                     if buzz_event.event.pubkey.to_hex() == *owner {
                                         let fired = signal_in_flight_task(
                                             &mut pool,
-                                            buzz_event.channel_id,
+                                            queue.session_key(buzz_event.channel_id),
                                             ControlSignal::Cancel,
                                         );
                                         if !fired {
@@ -2834,7 +3205,7 @@ async fn tokio_main() -> Result<()> {
                                     if buzz_event.event.pubkey.to_hex() == *owner {
                                         let fired = signal_in_flight_task(
                                             &mut pool,
-                                            buzz_event.channel_id,
+                                            queue.session_key(buzz_event.channel_id),
                                             ControlSignal::Rotate,
                                         );
                                         if fired {
@@ -2843,7 +3214,9 @@ async fn tokio_main() -> Result<()> {
                                                 "!rotate received — cancelling in-flight turn and rotating session"
                                             );
                                         } else {
-                                            let invalidated = pool.invalidate_channel_sessions(buzz_event.channel_id);
+                                            let invalidated = pool.invalidate_channel_sessions(
+                                                queue.session_key(buzz_event.channel_id),
+                                            );
                                             tracing::info!(
                                                 channel_id = %buzz_event.channel_id,
                                                 invalidated,
@@ -2975,7 +3348,7 @@ async fn tokio_main() -> Result<()> {
                                     if !native_attempted {
                                         signal_in_flight_task(
                                             &mut pool,
-                                            buzz_event.channel_id,
+                                            queue.session_key(buzz_event.channel_id),
                                             signal,
                                         );
                                     }
@@ -3329,7 +3702,7 @@ async fn tokio_main() -> Result<()> {
                 if let Ok(pool::SteerAck::Success { session_id }) = &ack {
                     queue.extend_in_flight_deadline(channel_id, config.max_turn_duration_secs);
                     if !pool.record_successful_steer(
-                        channel_id,
+                        queue.session_key(channel_id),
                         event_id.clone(),
                         session_id.clone(),
                     ) {
@@ -3352,7 +3725,11 @@ async fn tokio_main() -> Result<()> {
                     // front of `queues[channel_id]`, so the cancel
                     // will pick it up as part of the merged batch and
                     // re-prompt the agent.
-                    signal_in_flight_task(&mut pool, channel_id, ControlSignal::Steer);
+                    signal_in_flight_task(
+                        &mut pool,
+                        queue.session_key(channel_id),
+                        ControlSignal::Steer,
+                    );
                 }
                 // After releasing a withheld event, give dispatch a chance
                 // to re-flush. If the prompt is still in flight, the
@@ -3642,6 +4019,7 @@ fn try_native_steer(
     prompt_tag: String,
     steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
 ) -> bool {
+    let session_key = queue.session_key(channel_id);
     // Build the steer body: framing strings come from
     // `queue::native_steer_framing()` (Eva's drift-proof requirement —
     // native and cancel+merge fallback share these so the agent gets the
@@ -3677,7 +4055,7 @@ fn try_native_steer(
         ack_tx,
     };
 
-    match pool.send_steer(channel_id, request) {
+    match pool.send_steer(session_key, request) {
         Ok(()) => {
             // Withhold the queued event synchronously BEFORE spawning
             // the watcher: this closes the race where `mark_complete`
@@ -3739,13 +4117,14 @@ fn dispatch_pending(
             None => break,
         };
         let channel_id = batch.channel_id;
+        let session_key = queue.session_key(channel_id);
         let typing_scope = batch
             .events
             .last()
             .map(|event| queue::parse_thread_tags(&event.event))
             .unwrap_or_default();
-        let affinity_hit = pool.has_session_for(channel_id);
-        let mut agent = match pool.try_claim(Some(channel_id)) {
+        let affinity_hit = pool.has_session_for(session_key);
+        let mut agent = match pool.try_claim(Some(session_key)) {
             Some(a) => a,
             None => {
                 let pending = queue.pending_channels();
@@ -3802,7 +4181,7 @@ fn dispatch_pending(
             abort_handle.id(),
             pool::TaskMeta {
                 agent_index,
-                channel_id: Some(channel_id),
+                channel_id: Some(session_key),
                 turn_id,
                 recoverable_batch,
                 control_tx: Some(control_tx),
@@ -6799,6 +7178,7 @@ mod build_mcp_servers_tests {
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
+            session_scope: config::SessionScope::Channel,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
             heartbeat_prompt: None,
@@ -7023,6 +7403,7 @@ mod error_outcome_emission_tests {
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
+            session_scope: config::SessionScope::Channel,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
             heartbeat_prompt: None,

@@ -22,6 +22,68 @@ use crate::usage::{
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 
+/// Desktop establishes this only for a validated FirstMate managed session.
+/// It is deliberately paired with the ACP sidecar's own PID below; neither
+/// value may come from persona or agent configuration.
+const BUZZ_FIRSTMATE_HOME_ENV: &str = "BUZZ_FIRSTMATE_HOME";
+const BUZZ_FIRSTMATE_HARNESS_PID_ENV: &str = "BUZZ_FIRSTMATE_HARNESS_PID";
+const BUZZ_FIRSTMATE_SUPERVISOR_GENERATION_ENV: &str = "BUZZ_FIRSTMATE_SUPERVISOR_GENERATION";
+const BUZZ_DESKTOP_PID_ENV: &str = "BUZZ_DESKTOP_PID";
+const FIRSTMATE_HOME_ENV: &str = "FM_HOME";
+
+/// Return the exact environment that proves a FirstMate tool subprocess
+/// belongs to this ACP sidecar, or `None` when that cannot be established.
+///
+/// The bridge is intentionally fail-closed: `BUZZ_FIRSTMATE_HOME` must name a
+/// real canonical directory and the ACP sidecar itself must already be running
+/// from that directory. The PID is the live `buzz-acp` process that directly
+/// launches Codex, not the Desktop process and not an untrusted caller value.
+fn firstmate_harness_bridge_env(
+    home: &std::path::Path,
+    cwd: &std::path::Path,
+    harness_pid: u32,
+) -> Option<Vec<(std::ffi::OsString, std::ffi::OsString)>> {
+    let canonical_home = std::fs::canonicalize(home).ok()?;
+    let canonical_cwd = std::fs::canonicalize(cwd).ok()?;
+    if !canonical_home.is_dir() || canonical_home != canonical_cwd || harness_pid == 0 {
+        return None;
+    }
+
+    let home = canonical_home.into_os_string();
+    Some(vec![
+        (
+            std::ffi::OsString::from(BUZZ_FIRSTMATE_HOME_ENV),
+            home.clone(),
+        ),
+        (std::ffi::OsString::from(FIRSTMATE_HOME_ENV), home),
+        (
+            std::ffi::OsString::from(BUZZ_FIRSTMATE_HARNESS_PID_ENV),
+            harness_pid.to_string().into(),
+        ),
+    ])
+}
+
+fn firstmate_harness_bridge_env_from_process(
+) -> Option<Vec<(std::ffi::OsString, std::ffi::OsString)>> {
+    let home = std::env::var_os(BUZZ_FIRSTMATE_HOME_ENV)?;
+    let cwd = std::env::current_dir().ok()?;
+    firstmate_harness_bridge_env(std::path::Path::new(&home), &cwd, std::process::id())
+}
+
+/// Whether the current ACP sidecar can safely offer the FirstMate tool bridge.
+/// Kept at this boundary so the prompt and child-spawn paths cannot disagree.
+pub(crate) fn firstmate_harness_bridge_is_active() -> bool {
+    firstmate_harness_bridge_env_from_process().is_some()
+}
+
+fn is_firstmate_harness_bridge_env(key: &str) -> bool {
+    key == BUZZ_FIRSTMATE_HOME_ENV
+        || key == BUZZ_FIRSTMATE_HARNESS_PID_ENV
+        || key == BUZZ_FIRSTMATE_SUPERVISOR_GENERATION_ENV
+        || key == BUZZ_DESKTOP_PID_ENV
+        || key == FIRSTMATE_HOME_ENV
+}
+
 /// An MCP server configuration passed to `session/new`.
 ///
 /// Corresponds to the `McpServerStdio` variant in the ACP schema.
@@ -214,6 +276,11 @@ pub struct AcpClient {
     standard_usage: StandardUsageTracker,
     /// Known adapter identity for prompt-response usage mapping.
     standard_adapter: Option<StandardAdapterKind>,
+    /// Text emitted as `agent_message_chunk` during the current turn. ACP
+    /// normally treats this as observer telemetry because agents publish with
+    /// Buzz tools. Agent-scoped FirstMate sessions use it as a fail-safe reply
+    /// candidate when the model finishes without publishing to the channel.
+    turn_agent_message: String,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -460,6 +527,9 @@ impl AcpClient {
         use std::process::Stdio;
 
         let mut cmd = tokio::process::Command::new(command);
+        // This PID is a sidecar control-plane lease, not agent input. Keep it
+        // inside buzz-acp so a Claude/Codex subprocess cannot inherit it.
+        cmd.env_remove(BUZZ_DESKTOP_PID_ENV);
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -468,6 +538,22 @@ impl AcpClient {
             // Ensure the child is killed when the AcpClient is dropped (best-effort).
             // Callers MUST still call shutdown().await for guaranteed cleanup.
             .kill_on_drop(true);
+
+        // FirstMate's fleet lock normally identifies its owner through process
+        // ancestry. ACP tool commands can be executed by a desktop broker that
+        // is not a descendant of the Codex app-server, so bridge ownership to
+        // this stable sidecar pid explicitly. A bridge is valid only when the
+        // canonical managed home is also the sidecar's cwd; otherwise remove
+        // inherited claims and let FirstMate fail closed.
+        let firstmate_bridge = firstmate_harness_bridge_env_from_process();
+        let has_firstmate_bridge = firstmate_bridge.is_some();
+        if let Some(env) = firstmate_bridge {
+            cmd.envs(env);
+        } else {
+            cmd.env_remove(BUZZ_FIRSTMATE_HOME_ENV);
+            cmd.env_remove(BUZZ_FIRSTMATE_HARNESS_PID_ENV);
+            cmd.env_remove(BUZZ_FIRSTMATE_SUPERVISOR_GENERATION_ENV);
+        }
 
         // Per-persona env vars (e.g., GOOSE_PROVIDER, BUZZ_AGENT_PROVIDER).
         // For most keys, operator precedence wins: skip injection if already set
@@ -506,6 +592,16 @@ impl AcpClient {
         for (key, value) in extra_env {
             if key == "CODEX_CONFIG" && codex_merge_active {
                 // Handled by build_codex_config_env; skip here to avoid double-setting.
+                continue;
+            }
+            // The Desktop emits this bridge after validating the managed home;
+            // no persona, agent, or direct ACP caller may replace its home or
+            // owner PID. `FM_HOME` is protected only while the bridge is
+            // active so ordinary non-FirstMate ACP helpers retain legacy env
+            // behavior.
+            if is_firstmate_harness_bridge_env(key)
+                && (has_firstmate_bridge || key != FIRSTMATE_HOME_ENV)
+            {
                 continue;
             }
             if std::env::var_os(key).is_none() {
@@ -563,6 +659,7 @@ impl AcpClient {
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
+            turn_agent_message: String::new(),
         })
     }
 
@@ -597,6 +694,14 @@ impl AcpClient {
                 payload,
             );
         }
+    }
+
+    /// Consume the assistant text accumulated for the just-finished turn.
+    /// Empty/whitespace-only output is never a publishable reply.
+    pub(crate) fn take_turn_agent_message(&mut self) -> Option<String> {
+        let message = std::mem::take(&mut self.turn_agent_message);
+        let message = message.trim();
+        (!message.is_empty()).then(|| message.to_string())
     }
 
     /// Send the `initialize` request and return the agent's response result value.
@@ -781,6 +886,7 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
+        self.turn_agent_message.clear();
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
@@ -1756,6 +1862,7 @@ impl AcpClient {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::info!(target: "acp::stream", "{text}");
+                    self.turn_agent_message.push_str(text);
                 }
                 false
             }
@@ -2320,7 +2427,7 @@ impl Drop for AcpClient {
 /// Uses `nix::sys::signal::killpg` — a safe wrapper around the POSIX `killpg`
 /// syscall — so the crate's `#![deny(unsafe_code)]` policy is preserved.
 #[cfg(unix)]
-fn kill_process_group(pid: u32) -> bool {
+pub(crate) fn kill_process_group(pid: u32) -> bool {
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
 
@@ -2331,7 +2438,7 @@ fn kill_process_group(pid: u32) -> bool {
 /// Fallback for non-Unix: process-group kill not available.
 /// Returns `false` so the caller falls back to `child.start_kill()`.
 #[cfg(not(unix))]
-fn kill_process_group(_pid: u32) -> bool {
+pub(crate) fn kill_process_group(_pid: u32) -> bool {
     false
 }
 
@@ -2351,6 +2458,58 @@ fn configure_no_window(cmd: &mut tokio::process::Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn firstmate_bridge_emits_canonical_home_and_sidecar_pid_only_for_its_cwd() {
+        let root = std::env::temp_dir().join(format!(
+            "buzz-acp-firstmate-bridge-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("firstmate");
+        let other = root.join("other");
+        std::fs::create_dir_all(&home).expect("create FirstMate home");
+        std::fs::create_dir_all(&other).expect("create unrelated cwd");
+
+        let bridge = firstmate_harness_bridge_env(&home, &home, 4242)
+            .expect("canonical matching cwd must establish bridge");
+        let values: std::collections::BTreeMap<_, _> = bridge.into_iter().collect();
+        let canonical = std::fs::canonicalize(&home)
+            .expect("canonical home")
+            .into_os_string();
+        assert_eq!(
+            values.get(&std::ffi::OsString::from(BUZZ_FIRSTMATE_HOME_ENV)),
+            Some(&canonical)
+        );
+        assert_eq!(
+            values.get(&std::ffi::OsString::from(FIRSTMATE_HOME_ENV)),
+            Some(&canonical)
+        );
+        assert_eq!(
+            values.get(&std::ffi::OsString::from(BUZZ_FIRSTMATE_HARNESS_PID_ENV)),
+            Some(&std::ffi::OsString::from("4242"))
+        );
+        assert!(
+            firstmate_harness_bridge_env(&home, &other, 4242).is_none(),
+            "a home that is not the ACP sidecar cwd must fail closed"
+        );
+        assert!(firstmate_harness_bridge_env(&home, &home, 0).is_none());
+
+        std::fs::remove_dir_all(root).expect("remove bridge test directory");
+    }
+
+    #[test]
+    fn firstmate_bridge_keys_cannot_be_reintroduced_by_extra_env() {
+        for key in [
+            BUZZ_FIRSTMATE_HOME_ENV,
+            BUZZ_FIRSTMATE_HARNESS_PID_ENV,
+            BUZZ_DESKTOP_PID_ENV,
+            FIRSTMATE_HOME_ENV,
+        ] {
+            assert!(is_firstmate_harness_bridge_env(key));
+        }
+        assert!(!is_firstmate_harness_bridge_env("BUZZ_ACP_MODEL"));
+    }
 
     #[test]
     fn stop_reason_parses_all_known_values() {
@@ -3720,6 +3879,25 @@ mod tests {
         AcpClient::spawn("cat", &[], &[], false)
             .await
             .expect("spawn cat as inert client")
+    }
+
+    #[tokio::test]
+    async fn agent_message_chunks_form_one_turn_fallback_candidate() {
+        let mut client = spawn_inert_client().await;
+        for text in ["Capitão: ", "0 em flight, ", "3 em queued."] {
+            let update = serde_json::json!({
+                "params": { "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": text }
+                }}
+            });
+            client.handle_session_update(&update);
+        }
+        assert_eq!(
+            client.take_turn_agent_message().as_deref(),
+            Some("Capitão: 0 em flight, 3 em queued.")
+        );
+        assert_eq!(client.take_turn_agent_message(), None);
     }
 
     /// Build a `session/update` JSON-RPC notification carrying a
